@@ -1,0 +1,16 @@
+Cue table for 0_checkout
+Beat	Tag	Note	Track_Time	TC_Time	Section_Break
+0.00000		Video Black	00:00:00.00	00:00:00.00	1
+60.00000		(D3) LED Grids	00:01:00.00	00:01:00.00	1
+120.00000		(Automation) PSN Check	00:02:00.00	00:02:00.00	1
+180.00000		(Midi) LX Control	00:03:00.00	00:03:00.00	1
+210.00000		(Midi) Restore	00:03:30.00	00:03:30.00	1
+240.00000		(Matrix) BU	00:04:00.00	00:04:00.00	1
+300.00000		(Matrix) Restore Main	00:05:00.00	00:05:00.00	1
+360.00000		(LED) RGB Test	00:06:00.00	00:06:00.00	1
+420.00000		(LED) Colour Bars	00:07:00.00	00:07:00.00	1
+480.00000		(Sound) Timecode	00:08:00.00	00:08:00.00	1
+540.00000		(Projector) Lamp On and Check Shutter Each	00:09:00.00	00:09:00.00	1
+600.00000		(Rename Table) Actor Check	00:10:00.00	00:10:00.00	1
+660.00000		BLANK FOR LX	00:11:00.00	00:11:00.00	1
+720.00000			00:12:00.00	00:12:00.00	1
