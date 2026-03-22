@@ -3,10 +3,14 @@
 Export from Disguise cue tables + all_content_table.txt.
 
 Default outputs (Airtable-friendly):
-  exports/media.csv — one row per unique media file; primary column "Name"
-  exports/cues.csv — one row per cue with a non-empty CUE_NUMBER (Airtable primary);
-    columns: CUE_NUMBER, Act, CUE_NAME, Media (comma-separated Names for link import).
+  exports/media.csv — one row per unique media file (verbose filename + optional v###); column Name.
+  exports/channels.csv — one row per unique channel code (primary column Name), e.g. C01, C21.
+  exports/filesets.csv — one row per fileset; columns: Name, Channels (→ Channels), Media (→ Media).
+  exports/cues.csv — CUE_NUMBER, Act, CUE_NAME, Media (→ Media, per-file), Filesets (→ Filesets).
     Cues with no tag / empty CUE_NUMBER are omitted. Duplicate non-empty CUE_NUMBER → fatal error.
+
+Media filenames are parsed as NNN-NNN-<channel>-<description>.<ext> (channel = C + alphanumerics),
+e.g. 000-021-c11-grids_and_guides.mov → fileset 000-021-grids_and_guides, channel C11.
 
 Optional legacy file (newlines in VIDEOS column):
   python3 export_cues_csv.py --combined-out exports/cues_with_videos.csv
@@ -14,11 +18,10 @@ Optional legacy file (newlines in VIDEOS column):
 - CUE_NUMBER: TAG parsed from CUE XX.YYY.ZZ (pad to 2-3-2 digits) as
     int(XX)*100 + int(YYY) + int(ZZ)/100
 - CUE_NAME: Note column
-- Media filenames: final token only (+ optional v###); ###-###-C## + media extension.
 
 Usage:
   python3 export_cues_csv.py
-  python3 export_cues_csv.py --media-out a.csv --cues-out b.csv
+  python3 export_cues_csv.py --filesets-out a.csv --cues-out b.csv
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+from collections import defaultdict
 from pathlib import Path
 
 # Default paths (repo root = parent of this file)
@@ -34,6 +38,8 @@ ASSETS = ROOT / "assets"
 DEFAULT_ALL_CONTENT = ASSETS / "all_content_table.txt"
 DEFAULT_EXPORT_DIR = ROOT / "exports"
 DEFAULT_MEDIA_CSV = DEFAULT_EXPORT_DIR / "media.csv"
+DEFAULT_CHANNELS_CSV = DEFAULT_EXPORT_DIR / "channels.csv"
+DEFAULT_FILESETS_CSV = DEFAULT_EXPORT_DIR / "filesets.csv"
 DEFAULT_CUES_CSV = DEFAULT_EXPORT_DIR / "cues.csv"
 
 def discover_cue_files_and_tracks(assets_dir: Path) -> list[tuple[Path, str]]:
@@ -104,12 +110,55 @@ def asset_name_only(disguise_value: str) -> str:
     return v.strip()
 
 
+# Stem: three digit groups, channel token (c/C + alphanumerics), then description (rest).
+_FILESET_STEM_RE = re.compile(
+    r"^(\d{3})-(\d{3})-([cC][a-zA-Z0-9]+)-(.+)$"
+)
+
+
+def first_media_token(normalized_final: str) -> str:
+    """Filename token before optional Disguise version (e.g. 'clip.mov v001' -> 'clip.mov')."""
+    s = (normalized_final or "").strip()
+    if not s:
+        return ""
+    return re.split(r"\s+", s, maxsplit=1)[0]
+
+
+def stem_without_known_extension(filename: str) -> str:
+    first = (filename or "").strip()
+    if not first:
+        return ""
+    lower = first.lower()
+    for ext in sorted(_MEDIA_EXT_SUFFIXES, key=len, reverse=True):
+        if lower.endswith(ext):
+            return first[: len(first) - len(ext)]
+    return first
+
+
+def fileset_key_and_channel_from_final(normalized_final: str) -> tuple[str, str] | None:
+    """
+    Parse NNN-NNN-<channel>-<description> from normalized media line.
+    Returns (fileset_key, channel) e.g. ('000-021-grids_and_guides', 'C11') or None.
+    """
+    token = first_media_token(normalized_final)
+    if not token:
+        return None
+    stem = stem_without_known_extension(token)
+    m = _FILESET_STEM_RE.match(stem)
+    if not m:
+        return None
+    d1, d2, ch_raw, desc = m.groups()
+    desc = desc.strip()
+    if not desc:
+        return None
+    channel = "C" + ch_raw[1:]
+    fileset_key = f"{d1}-{d2}-{desc}"
+    return (fileset_key, channel)
+
+
 def asset_matches_naming_convention(asset_name: str) -> bool:
-    """
-    Keep only assets containing ###-###-C## (case-insensitive C),
-    e.g. 101-300-c03-scrim_gradient.mov v001
-    """
-    return bool(re.search(r"\b\d{3}-\d{3}-[cC]\d{2}\b", asset_name or ""))
+    """True if the asset parses as a fileset + channel (NNN-NNN-c…-description)."""
+    return fileset_key_and_channel_from_final(asset_name or "") is not None
 
 
 # Filename token before optional Disguise version (e.g. "clip.mov v001" -> "clip.mov")
@@ -289,8 +338,8 @@ def find_best_section(
     return min(candidates, key=score)
 
 
-def media_list_for_section_videos(videos: dict[str, str]) -> list[str]:
-    """Ordered unique media Names for a section (sorted by filename for stability)."""
+def normalized_media_files_for_section_videos(videos: dict[str, str]) -> list[str]:
+    """Ordered unique final filenames (for legacy VIDEOS column)."""
     if not videos:
         return []
     names: list[str] = []
@@ -309,23 +358,67 @@ def media_list_for_section_videos(videos: dict[str, str]) -> list[str]:
     return names
 
 
+def section_filesets_and_media_for_videos(
+    videos: dict[str, str],
+    fileset_channels: defaultdict[str, set[str]],
+    fileset_media: defaultdict[str, set[str]],
+) -> tuple[list[str], list[str]]:
+    """
+    For one section's videos: ordered unique fileset keys, ordered unique media filenames.
+    Updates fileset_channels and fileset_media with every parsed file.
+    """
+    if not videos:
+        return [], []
+    keys: list[str] = []
+    seen_fs: set[str] = set()
+    media: list[str] = []
+    seen_m: set[str] = set()
+    for _layer, disguise_val in sorted(videos.items()):
+        final = normalized_video_filename_from_disguise_value(disguise_val)
+        if not final:
+            continue
+        if not asset_has_media_file_extension(final):
+            continue
+        spec = fileset_key_and_channel_from_final(final)
+        if spec is None:
+            continue
+        fkey, ch = spec
+        fileset_channels[fkey].add(ch)
+        fileset_media[fkey].add(final)
+        if fkey not in seen_fs:
+            seen_fs.add(fkey)
+            keys.append(fkey)
+        if final not in seen_m:
+            seen_m.add(final)
+            media.append(final)
+    return keys, media
+
+
 def format_videos_field(videos: dict[str, str]) -> str:
     """Legacy: one line per unique file (newline-separated)."""
-    return "\n".join(media_list_for_section_videos(videos))
+    return "\n".join(normalized_media_files_for_section_videos(videos))
 
 
-def build_cue_and_media_rows(
+def build_cue_and_fileset_rows(
     all_content_path: Path, assets_dir: Path
-) -> tuple[list[dict[str, str | list[str]]], list[str]]:
+) -> tuple[
+    list[dict[str, str | list[str]]],
+    dict[str, list[str]],
+    dict[str, list[str]],
+    list[str],
+]:
     """
     Returns:
-      cue_rows: dicts with act, cue_number, cue_name, media (list of Name strings)
-      media_names: sorted unique Name values for Media table
+      cue_rows: act, cue_number, cue_name, media (filenames), filesets (fileset keys)
+      filesets_channels: fileset key -> sorted channel codes
+      filesets_media: fileset key -> sorted media Names for that fileset
+      media_names: sorted unique media Names (for media.csv)
     """
     tracks = parse_all_content(all_content_path)
     cue_file_track_pairs = discover_cue_files_and_tracks(assets_dir)
     cue_rows: list[dict[str, str | list[str]]] = []
-    all_media: set[str] = set()
+    fileset_channels: defaultdict[str, set[str]] = defaultdict(set)
+    fileset_media: defaultdict[str, set[str]] = defaultdict(set)
 
     for cue_file, track in cue_file_track_pairs:
         cues = read_cue_table(cue_file)
@@ -338,11 +431,12 @@ def build_cue_and_media_rows(
             num = tag_to_cue_number(tag)
 
             best = find_best_section(sections, note, tc)
+            fileset_list: list[str] = []
             media_list: list[str] = []
             if best is not None:
-                media_list = media_list_for_section_videos(best.get("videos") or {})
-                for m in media_list:
-                    all_media.add(m)
+                fileset_list, media_list = section_filesets_and_media_for_videos(
+                    best.get("videos") or {}, fileset_channels, fileset_media
+                )
 
             cue_rows.append(
                 {
@@ -350,10 +444,14 @@ def build_cue_and_media_rows(
                     "cue_number": num,
                     "cue_name": note,
                     "media": media_list,
+                    "filesets": fileset_list,
                 }
             )
 
-    return cue_rows, sorted(all_media)
+    fs_ch = {k: sorted(v) for k, v in fileset_channels.items()}
+    fs_med = {k: sorted(v) for k, v in fileset_media.items()}
+    all_media = sorted({m for names in fs_med.values() for m in names})
+    return cue_rows, fs_ch, fs_med, all_media
 
 
 def assert_unique_cue_numbers(cue_rows: list[dict[str, str | list[str]]]) -> None:
@@ -372,7 +470,9 @@ def assert_unique_cue_numbers(cue_rows: list[dict[str, str | list[str]]]) -> Non
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Export cues + media CSVs for Airtable.")
+    parser = argparse.ArgumentParser(
+        description="Export media, channels, filesets, and cues CSVs for Airtable."
+    )
     parser.add_argument(
         "-i",
         "--input",
@@ -384,13 +484,25 @@ def main() -> None:
         "--export-dir",
         type=Path,
         default=DEFAULT_EXPORT_DIR,
-        help="Directory for default media.csv and cues.csv",
+        help="Directory for default media.csv, channels.csv, filesets.csv, cues.csv",
     )
     parser.add_argument(
         "--media-out",
         type=Path,
         default=None,
         help="Override path for media.csv",
+    )
+    parser.add_argument(
+        "--channels-out",
+        type=Path,
+        default=None,
+        help="Override path for channels.csv",
+    )
+    parser.add_argument(
+        "--filesets-out",
+        type=Path,
+        default=None,
+        help="Override path for filesets.csv",
     )
     parser.add_argument(
         "--cues-out",
@@ -412,22 +524,53 @@ def main() -> None:
 
     export_dir = args.export_dir
     media_path = args.media_out or (export_dir / "media.csv")
+    channels_path = args.channels_out or (export_dir / "channels.csv")
+    filesets_path = args.filesets_out or (export_dir / "filesets.csv")
     cues_path = args.cues_out or (export_dir / "cues.csv")
 
-    cue_rows, media_names = build_cue_and_media_rows(all_content_path, ASSETS)
+    cue_rows, filesets_map, filesets_media_map, media_names = (
+        build_cue_and_fileset_rows(all_content_path, ASSETS)
+    )
     assert_unique_cue_numbers(cue_rows)
 
     export_dir.mkdir(parents=True, exist_ok=True)
 
-    # Media table: primary field must match linked names in Cues
     with media_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["Name"], quoting=csv.QUOTE_MINIMAL)
-        w.writeheader()
+        mw = csv.DictWriter(f, fieldnames=["Name"], quoting=csv.QUOTE_MINIMAL)
+        mw.writeheader()
         for name in media_names:
-            w.writerow({"Name": name})
+            mw.writerow({"Name": name})
+
+    all_channel_codes: set[str] = set()
+    for chans in filesets_map.values():
+        all_channel_codes.update(chans)
+
+    with channels_path.open("w", newline="", encoding="utf-8") as f:
+        cw = csv.DictWriter(f, fieldnames=["Name"], quoting=csv.QUOTE_MINIMAL)
+        cw.writeheader()
+        for code in sorted(all_channel_codes):
+            cw.writerow({"Name": code})
+
+    # Filesets: Channels → Channels table; Media → Media table (comma-separated Names)
+    with filesets_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=["Name", "Channels", "Media"],
+            quoting=csv.QUOTE_MINIMAL,
+        )
+        w.writeheader()
+        for name in sorted(filesets_map.keys()):
+            med = filesets_media_map.get(name, [])
+            w.writerow(
+                {
+                    "Name": name,
+                    "Channels": ",".join(filesets_map[name]),
+                    "Media": ",".join(med),
+                }
+            )
 
     # Cues: primary field CUE_NUMBER (globally unique). Omit rows with no tag / empty number.
-    cue_fieldnames = ["CUE_NUMBER", "Act", "CUE_NAME", "Media"]
+    cue_fieldnames = ["CUE_NUMBER", "Act", "CUE_NAME", "Media", "Filesets"]
     airtable_cue_rows = [
         r
         for r in cue_rows
@@ -441,19 +584,24 @@ def main() -> None:
             act = str(row["act"])
             num = str(row["cue_number"]).strip()
             name = str(row["cue_name"])
-            media_list = row["media"]
-            assert isinstance(media_list, list)
+            med_list = row["media"]
+            fs_list = row["filesets"]
+            assert isinstance(med_list, list)
+            assert isinstance(fs_list, list)
             w.writerow(
                 {
                     "CUE_NUMBER": num,
                     "Act": act,
                     "CUE_NAME": name,
                     # No spaces after commas — Airtable matches linked record names exactly
-                    "Media": ",".join(media_list),
+                    "Media": ",".join(med_list),
+                    "Filesets": ",".join(fs_list),
                 }
             )
 
     print(f"Wrote {len(media_names)} media rows -> {media_path}")
+    print(f"Wrote {len(all_channel_codes)} channel rows -> {channels_path}")
+    print(f"Wrote {len(filesets_map)} fileset rows -> {filesets_path}")
     print(f"Wrote {len(airtable_cue_rows)} cue rows -> {cues_path} (omitted {omitted} with empty CUE_NUMBER)")
 
     if args.combined_out is not None:

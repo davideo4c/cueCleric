@@ -1,11 +1,11 @@
 # Cue Cleric
 
-Export Disguise **cue tables** and **all content** into CSVs for **Airtable** (Media + Cues with linked media), with an optional API sync.
+Export Disguise **cue tables** and **all content** into CSVs for **Airtable** (Filesets + Cues with linked filesets), with an optional API sync.
 
 ## Quick start
 
 ```bash
-python3 export_cues_csv.py          # writes exports/media.csv, exports/cues.csv
+python3 export_cues_csv.py          # writes exports/media.csv, channels.csv, filesets.csv, cues.csv
 python3 push_airtable.py --dry-run  # preview Airtable sync
 python3 push_airtable.py            # requires .env (see docs/AIRTABLE.md)
 ```
@@ -36,7 +36,7 @@ Use SSH if you prefer: `git@github.com:YOUR_USER/YOUR_REPO.git`
 | Path | Purpose |
 |------|---------|
 | `assets/` | Disguise exports (`all_content_table.txt`, `*cue_table*.txt`) |
-| `export_cues_csv.py` | Build `exports/media.csv` + `exports/cues.csv` |
+| `export_cues_csv.py` | Build `exports/media.csv`, `channels.csv`, `filesets.csv`, `cues.csv` |
 | `push_airtable.py` | Sync CSVs to Airtable via API |
 | `exports/` | Generated CSVs (optional to track in git) |
 | `docs/AIRTABLE.md` | Base schema + workflow |

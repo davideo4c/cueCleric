@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Push exports/media.csv and exports/cues.csv to Airtable via the REST API.
+Push exports/media.csv, channels.csv, filesets.csv, and cues.csv to Airtable via the REST API.
 
 Prerequisites:
   1. Run: python3 export_cues_csv.py
@@ -12,12 +12,20 @@ Environment variables:
   AIRTABLE_BASE_ID     Required. Base ID (starts with app...)
 
 Optional:
-  AIRTABLE_MEDIA_TABLE          Default: Media
-  AIRTABLE_CUES_TABLE           Default: Cues
-  AIRTABLE_MEDIA_NAME_FIELD     Primary field on Media table. Default: Name
-  AIRTABLE_CUE_PRIMARY_FIELD    Primary field on Cues (CUE_NUMBER). Default: CUE_NUMBER
-  AIRTABLE_CUE_WRITABLE_FIELDS  Comma-separated fields PATCH may update.
-                                Default: Act,CUE_NAME,Media (never Description, Call, Page number, Notes)
+  AIRTABLE_MEDIA_TABLE              Default: Media
+  AIRTABLE_MEDIA_NAME_FIELD         Primary on Media. Default: Name
+  AIRTABLE_CHANNELS_TABLE           Default: Channels
+  AIRTABLE_CHANNELS_NAME_FIELD      Primary on Channels. Default: Name
+  AIRTABLE_FILESETS_TABLE           Default: Filesets
+  AIRTABLE_FILESETS_NAME_FIELD      Primary on Filesets. Default: Name
+  AIRTABLE_FILESETS_CHANNELS_FIELD  Filesets → Channels (multiple). Default: Channels
+  AIRTABLE_FILESETS_MEDIA_FIELD     Filesets → Media (multiple). Default: Media
+  AIRTABLE_CUES_TABLE               Default: Cues
+  AIRTABLE_CUE_MEDIA_FIELD          Cues → Media (multiple). Default: Media
+  AIRTABLE_CUE_FILESETS_FIELD       Cues → Filesets (multiple). Default: Filesets
+  AIRTABLE_CUE_PRIMARY_FIELD        Primary on Cues (CUE_NUMBER). Default: CUE_NUMBER
+  AIRTABLE_CUE_WRITABLE_FIELDS      Default: Act,CUE_NAME,Media,Filesets
+  AIRTABLE_CUE_NOTES_FIELD          Orphan retention. Default: Notes
 
 Usage:
   export AIRTABLE_TOKEN=pat...
@@ -25,7 +33,9 @@ Usage:
   python3 push_airtable.py --dry-run
   python3 push_airtable.py
 
-  python3 push_airtable.py --media-csv exports/media.csv --cues-csv exports/cues.csv
+  python3 push_airtable.py --media-csv exports/media.csv \\
+      --channels-csv exports/channels.csv --filesets-csv exports/filesets.csv \\
+      --cues-csv exports/cues.csv
 """
 
 from __future__ import annotations
@@ -35,6 +45,7 @@ import csv
 import json
 import os
 import sys
+from typing import Callable
 import time
 import urllib.error
 import urllib.parse
@@ -43,6 +54,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_MEDIA_CSV = ROOT / "exports" / "media.csv"
+DEFAULT_CHANNELS_CSV = ROOT / "exports" / "channels.csv"
+DEFAULT_FILESETS_CSV = ROOT / "exports" / "filesets.csv"
 DEFAULT_CUES_CSV = ROOT / "exports" / "cues.csv"
 
 # Airtable allows up to 10 records per create/patch request
@@ -123,13 +136,75 @@ def list_all_records(
 
 def create_records(
     base_id: str, table: str, token: str, records_fields: list[dict]
-) -> None:
+) -> list[dict]:
+    """POST records in batches; return Airtable record dicts (id + fields) from all responses."""
+    created: list[dict] = []
     for i in range(0, len(records_fields), BATCH):
         chunk = records_fields[i : i + BATCH]
         body = {"records": [{"fields": f} for f in chunk]}
         url = f"https://api.airtable.com/v0/{urllib.parse.quote(base_id)}/{urllib.parse.quote(table)}"
         time.sleep(REQUEST_DELAY_S)
-        api_request("POST", url, token, body)
+        payload = api_request("POST", url, token, body)
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Unexpected POST response from {table}")
+        created.extend(payload.get("records") or [])
+    return created
+
+
+def merge_created_by_primary_field(
+    created: list[dict],
+    primary_field: str,
+    id_by_key: dict[str, str],
+    *,
+    primary_reader: Callable[[dict, str], str | None] | None = None,
+) -> None:
+    """Insert id into id_by_key using primary field value from each created record."""
+    for rec in created:
+        rid = rec.get("id")
+        if not rid:
+            continue
+        fields = rec.get("fields") or {}
+        if primary_reader is not None:
+            key = primary_reader(fields, primary_field)
+        else:
+            val = fields.get(primary_field)
+            key = val.strip() if isinstance(val, str) and val.strip() else None
+            if key is None and isinstance(val, (int, float)):
+                key = str(val)
+        if key:
+            id_by_key[key] = rid
+
+
+def normalized_link_ids(val) -> tuple[str, ...]:
+    """Order-independent comparison for Airtable linked-record fields."""
+    if not val:
+        return ()
+    if isinstance(val, list):
+        return tuple(sorted(str(x) for x in val))
+    return ()
+
+
+def normalized_scalar(val) -> str:
+    if val is None:
+        return ""
+    return str(val).strip()
+
+
+def airtable_field_matches_desired(existing_val, desired_val) -> bool:
+    """True if Airtable GET value already matches a PATCH value we would send."""
+    if isinstance(desired_val, list):
+        return normalized_link_ids(existing_val) == tuple(
+            sorted(str(x) for x in desired_val)
+        )
+    return normalized_scalar(existing_val) == normalized_scalar(desired_val)
+
+
+def patch_redundant_with_existing(existing_fields: dict, patch: dict) -> bool:
+    """True if every key in patch already equals existing_fields (skip PATCH)."""
+    return all(
+        airtable_field_matches_desired(existing_fields.get(k), v)
+        for k, v in patch.items()
+    )
 
 
 def update_records(
@@ -146,7 +221,17 @@ def update_records(
         api_request("PATCH", url, token, body)
 
 
+def delete_record(base_id: str, table: str, token: str, record_id: str) -> None:
+    url = (
+        f"https://api.airtable.com/v0/{urllib.parse.quote(base_id)}/"
+        f"{urllib.parse.quote(table)}/{urllib.parse.quote(record_id)}"
+    )
+    time.sleep(REQUEST_DELAY_S)
+    api_request("DELETE", url, token, None)
+
+
 def read_media_csv(path: Path) -> list[str]:
+    """Media Names from media.csv (primary)."""
     names: list[str] = []
     with path.open(encoding="utf-8", newline="") as f:
         r = csv.DictReader(f)
@@ -159,11 +244,47 @@ def read_media_csv(path: Path) -> list[str]:
     return names
 
 
+def read_channels_csv(path: Path) -> list[str]:
+    """Channel codes from channels.csv (primary Name)."""
+    names: list[str] = []
+    with path.open(encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        if not r.fieldnames or "Name" not in r.fieldnames:
+            raise SystemExit(f"{path}: need a 'Name' column")
+        for row in r:
+            n = (row.get("Name") or "").strip()
+            if n:
+                names.append(n)
+    return names
+
+
+def read_filesets_csv(path: Path) -> list[dict[str, str]]:
+    """Rows from filesets.csv: Name, Channels, Media (comma-separated link names)."""
+    out: list[dict[str, str]] = []
+    required = {"Name", "Channels", "Media"}
+    with path.open(encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        if not r.fieldnames or not required.issubset(set(r.fieldnames)):
+            raise SystemExit(f"{path}: need columns {sorted(required)}")
+        for row in r:
+            name = (row.get("Name") or "").strip()
+            if not name:
+                continue
+            out.append(
+                {
+                    "Name": name,
+                    "Channels": (row.get("Channels") or "").strip(),
+                    "Media": (row.get("Media") or "").strip(),
+                }
+            )
+    return out
+
+
 def read_cues_csv(path: Path) -> tuple[list[dict[str, str]], int]:
     """Return (rows with non-empty CUE_NUMBER, count of skipped empty rows)."""
     rows: list[dict[str, str]] = []
     skipped_empty = 0
-    required = {"CUE_NUMBER", "Act", "CUE_NAME", "Media"}
+    required = {"CUE_NUMBER", "Act", "CUE_NAME", "Media", "Filesets"}
     with path.open(encoding="utf-8", newline="") as f:
         r = csv.DictReader(f)
         if not r.fieldnames or not required.issubset(set(r.fieldnames)):
@@ -177,8 +298,8 @@ def read_cues_csv(path: Path) -> tuple[list[dict[str, str]], int]:
     return rows, skipped_empty
 
 
-def parse_media_links(cell: str) -> list[str]:
-    """Split Media cell from CSV (comma-separated Names, no spaces)."""
+def parse_comma_separated_cell(cell: str) -> list[str]:
+    """Split CSV cell (comma-separated tokens, no spaces after commas)."""
     if not cell:
         return []
     return [p.strip() for p in cell.split(",") if p.strip()]
@@ -186,7 +307,7 @@ def parse_media_links(cell: str) -> list[str]:
 
 def parse_writable_fields(env_val: str) -> list[str]:
     """Fields allowed on PATCH (must not include manual-only fields)."""
-    raw = (env_val or "Act,CUE_NAME,Media").strip()
+    raw = (env_val or "Act,CUE_NAME,Media,Filesets").strip()
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
@@ -198,11 +319,47 @@ def build_patch_fields(
     return {k: v for k, v in full_row_fields.items() if k in writable}
 
 
+def cue_primary_from_fields(
+    fields: dict, cue_primary_field: str
+) -> str | None:
+    key = fields.get(cue_primary_field)
+    if isinstance(key, str) and key.strip():
+        return key.strip()
+    if isinstance(key, (int, float)):
+        return str(key)
+    return None
+
+
+def airtable_cue_name(fields: dict, cue_name_field: str) -> str:
+    v = fields.get(cue_name_field)
+    if isinstance(v, str):
+        return v.strip()
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def notes_field_nonempty(fields: dict, notes_field: str) -> bool:
+    """True if Notes (or linked notes) has content — record should be kept when orphaned."""
+    val = fields.get(notes_field)
+    if val is None:
+        return False
+    if isinstance(val, list):
+        return len(val) > 0
+    if isinstance(val, str):
+        return val.strip() != ""
+    return bool(val)
+
+
 def main() -> None:
     load_dotenv_if_present()
 
-    p = argparse.ArgumentParser(description="Sync media.csv + cues.csv to Airtable.")
+    p = argparse.ArgumentParser(
+        description="Sync media + channels + filesets + cues CSVs to Airtable."
+    )
     p.add_argument("--media-csv", type=Path, default=DEFAULT_MEDIA_CSV)
+    p.add_argument("--channels-csv", type=Path, default=DEFAULT_CHANNELS_CSV)
+    p.add_argument("--filesets-csv", type=Path, default=DEFAULT_FILESETS_CSV)
     p.add_argument("--cues-csv", type=Path, default=DEFAULT_CUES_CSV)
     p.add_argument("--dry-run", action="store_true", help="Print plan only; no API calls")
     args = p.parse_args()
@@ -210,8 +367,26 @@ def main() -> None:
     token = os.environ.get("AIRTABLE_TOKEN", "").strip()
     base_id = os.environ.get("AIRTABLE_BASE_ID", "").strip()
     media_table = os.environ.get("AIRTABLE_MEDIA_TABLE", "Media").strip()
+    media_name_field = os.environ.get("AIRTABLE_MEDIA_NAME_FIELD", "Name").strip()
+    channels_table = os.environ.get("AIRTABLE_CHANNELS_TABLE", "Channels").strip()
+    channels_name_field = os.environ.get(
+        "AIRTABLE_CHANNELS_NAME_FIELD", "Name"
+    ).strip()
+    filesets_table = os.environ.get("AIRTABLE_FILESETS_TABLE", "Filesets").strip()
+    filesets_name_field = os.environ.get(
+        "AIRTABLE_FILESETS_NAME_FIELD", "Name"
+    ).strip()
+    filesets_channels_field = os.environ.get(
+        "AIRTABLE_FILESETS_CHANNELS_FIELD", "Channels"
+    ).strip()
+    filesets_media_field = os.environ.get(
+        "AIRTABLE_FILESETS_MEDIA_FIELD", "Media"
+    ).strip()
     cues_table = os.environ.get("AIRTABLE_CUES_TABLE", "Cues").strip()
-    name_field = os.environ.get("AIRTABLE_MEDIA_NAME_FIELD", "Name").strip()
+    cue_media_field = os.environ.get("AIRTABLE_CUE_MEDIA_FIELD", "Media").strip()
+    cue_filesets_field = os.environ.get(
+        "AIRTABLE_CUE_FILESETS_FIELD", "Filesets"
+    ).strip()
     cue_primary_field = os.environ.get(
         "AIRTABLE_CUE_PRIMARY_FIELD", "CUE_NUMBER"
     ).strip()
@@ -220,6 +395,9 @@ def main() -> None:
     )
     # Never PATCH the primary field by mistake
     writable_fields = [f for f in writable_fields if f != cue_primary_field]
+    notes_airtable_field = os.environ.get(
+        "AIRTABLE_CUE_NOTES_FIELD", "Notes"
+    ).strip()
 
     if not args.dry_run and (not token or not base_id):
         print(
@@ -235,89 +413,361 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    if not args.media_csv.is_file() or not args.cues_csv.is_file():
-        print("Run export_cues_csv.py first, or pass --media-csv / --cues-csv.", file=sys.stderr)
+    if (
+        not args.media_csv.is_file()
+        or not args.channels_csv.is_file()
+        or not args.filesets_csv.is_file()
+        or not args.cues_csv.is_file()
+    ):
+        print(
+            "Run export_cues_csv.py first, or pass --media-csv / --channels-csv / "
+            "--filesets-csv / --cues-csv.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     media_names = read_media_csv(args.media_csv)
+    channel_names = read_channels_csv(args.channels_csv)
+    fileset_rows = read_filesets_csv(args.filesets_csv)
     cue_rows, skipped_cues = read_cues_csv(args.cues_csv)
 
+    needed_channel_codes: set[str] = set(channel_names)
+    for fr in fileset_rows:
+        needed_channel_codes.update(parse_comma_separated_cell(fr["Channels"]))
+
+    needed_media_names: set[str] = set(media_names)
+    for fr in fileset_rows:
+        needed_media_names.update(parse_comma_separated_cell(fr["Media"]))
+    for cr in cue_rows:
+        needed_media_names.update(parse_comma_separated_cell(cr["Media"]))
+
     if args.dry_run:
-        print(f"Would sync {len(media_names)} Media names, {len(cue_rows)} Cues")
+        print(
+            f"Would sync {len(needed_media_names)} Media, "
+            f"{len(needed_channel_codes)} Channels, "
+            f"{len(fileset_rows)} Filesets, {len(cue_rows)} Cues"
+        )
         if skipped_cues:
             print(f"  (Skipped {skipped_cues} cue rows with empty CUE_NUMBER in CSV)")
         print(f"  Base: {base_id or '(not set)'}")
-        print(f"  Tables: {media_table!r}, {cues_table!r}")
-        print(f"  Media primary field: {name_field!r}")
+        print(
+            f"  Tables: {media_table!r}, {channels_table!r}, "
+            f"{filesets_table!r}, {cues_table!r}"
+        )
+        print(f"  Media primary field: {media_name_field!r}")
+        print(f"  Channels primary field: {channels_name_field!r}")
+        print(
+            f"  Filesets.{filesets_channels_field!r} → {channels_table!r}; "
+            f"Filesets.{filesets_media_field!r} → {media_table!r}"
+        )
+        print(f"  Filesets primary field: {filesets_name_field!r}")
+        print(
+            f"  Cues.{cue_media_field!r} → {media_table!r}; "
+            f"Cues.{cue_filesets_field!r} → {filesets_table!r}"
+        )
         print(f"  Cues primary field: {cue_primary_field!r}")
         print(f"  PATCH fields only: {writable_fields}")
+        print(
+            f"  Orphan cleanup: name-matched primary migration; "
+            f"keep if {notes_airtable_field!r} non-empty else delete"
+        )
         return
 
-    # --- Media: ensure every Name exists ---
+    # --- Media: ensure every Name exists (Cues + Filesets link targets) ---
     print("Fetching existing Media records...")
-    media_recs = list_all_records(base_id, media_table, token, fields=[name_field])
-    name_to_id: dict[str, str] = {}
+    media_recs = list_all_records(
+        base_id, media_table, token, fields=[media_name_field]
+    )
+    media_name_to_id: dict[str, str] = {}
     for rec in media_recs:
         rid = rec["id"]
         fields = rec.get("fields") or {}
-        val = fields.get(name_field)
+        val = fields.get(media_name_field)
         if isinstance(val, str) and val.strip():
-            name_to_id[val.strip()] = rid
+            media_name_to_id[val.strip()] = rid
 
-    missing = [n for n in media_names if n not in name_to_id]
-    print(f"Media: {len(name_to_id)} existing, {len(missing)} to create")
-    if missing:
-        create_records(
+    missing_media = sorted(needed_media_names - set(media_name_to_id.keys()))
+    print(f"Media: {len(media_name_to_id)} existing, {len(missing_media)} to create")
+    if missing_media:
+        created_m = create_records(
             base_id,
             media_table,
             token,
-            [{name_field: n} for n in missing],
+            [{media_name_field: n} for n in missing_media],
         )
-        print("Re-fetching Media after create...")
-        media_recs = list_all_records(base_id, media_table, token, fields=[name_field])
-        name_to_id.clear()
-        for rec in media_recs:
-            val = (rec.get("fields") or {}).get(name_field)
-            if isinstance(val, str) and val.strip():
-                name_to_id[val.strip()] = rec["id"]
+        merge_created_by_primary_field(
+            created_m, media_name_field, media_name_to_id
+        )
+        print(f"  Merged {len(created_m)} Media record(s) from POST response.")
 
-    # --- Cues: upsert by CUE_NUMBER (primary) ---
+    # --- Channels: ensure every Name exists (Filesets link targets) ---
+    print("Fetching existing Channels records...")
+    channel_recs = list_all_records(
+        base_id, channels_table, token, fields=[channels_name_field]
+    )
+    channel_name_to_id: dict[str, str] = {}
+    for rec in channel_recs:
+        rid = rec["id"]
+        fields = rec.get("fields") or {}
+        val = fields.get(channels_name_field)
+        if isinstance(val, str) and val.strip():
+            channel_name_to_id[val.strip()] = rid
+
+    missing_ch = sorted(needed_channel_codes - set(channel_name_to_id.keys()))
+    print(f"Channels: {len(channel_name_to_id)} existing, {len(missing_ch)} to create")
+    if missing_ch:
+        created_ch = create_records(
+            base_id,
+            channels_table,
+            token,
+            [{channels_name_field: code} for code in missing_ch],
+        )
+        merge_created_by_primary_field(
+            created_ch, channels_name_field, channel_name_to_id
+        )
+        print(f"  Merged {len(created_ch)} Channels record(s) from POST response.")
+
+    # --- Filesets: upsert Name + Channels + Media (linked record IDs) ---
+    print("Fetching existing Filesets records...")
+    fs_fetch_fields = list(
+        {filesets_name_field, filesets_channels_field, filesets_media_field}
+    )
+    fileset_recs = list_all_records(
+        base_id, filesets_table, token, fields=fs_fetch_fields
+    )
+    fileset_name_to_id: dict[str, str] = {}
+    fileset_id_to_fields: dict[str, dict] = {}
+    for rec in fileset_recs:
+        rid = rec["id"]
+        fields = rec.get("fields") or {}
+        fileset_id_to_fields[rid] = fields
+        val = fields.get(filesets_name_field)
+        if isinstance(val, str) and val.strip():
+            fileset_name_to_id[val.strip()] = rid
+
+    to_create_fs: list[dict] = []
+    to_update_fs: list[tuple[str, dict]] = []
+    unresolved_ch: list[tuple[str, str]] = []
+    unresolved_fs_media: list[tuple[str, str]] = []
+    for fr in fileset_rows:
+        n = fr["Name"]
+        ch_link_ids: list[str] = []
+        for code in parse_comma_separated_cell(fr["Channels"]):
+            cid = channel_name_to_id.get(code)
+            if cid:
+                ch_link_ids.append(cid)
+            else:
+                unresolved_ch.append((n, code))
+        med_link_ids: list[str] = []
+        for mname in parse_comma_separated_cell(fr["Media"]):
+            mid = media_name_to_id.get(mname)
+            if mid:
+                med_link_ids.append(mid)
+            else:
+                unresolved_fs_media.append((n, mname))
+        body = {
+            filesets_channels_field: ch_link_ids,
+            filesets_media_field: med_link_ids,
+        }
+        if n in fileset_name_to_id:
+            rid = fileset_name_to_id[n]
+            ex = fileset_id_to_fields.get(rid, {})
+            if not patch_redundant_with_existing(ex, body):
+                to_update_fs.append((rid, body))
+        else:
+            to_create_fs.append({filesets_name_field: n, **body})
+
+    if unresolved_fs_media:
+        print(
+            "WARNING: missing Media rows for some filesets (skipped those links):",
+            file=sys.stderr,
+        )
+        for fsname, mn in unresolved_fs_media[:15]:
+            print(
+                f"  Fileset={fsname!r} missing Media Name={mn!r}",
+                file=sys.stderr,
+            )
+        if len(unresolved_fs_media) > 15:
+            print(f"  ... and {len(unresolved_fs_media) - 15} more", file=sys.stderr)
+
+    if unresolved_ch:
+        print(
+            "WARNING: missing Channels rows for some filesets (skipped those links):",
+            file=sys.stderr,
+        )
+        for fsname, code in unresolved_ch[:15]:
+            print(
+                f"  Fileset={fsname!r} missing Channel Name={code!r}",
+                file=sys.stderr,
+            )
+        if len(unresolved_ch) > 15:
+            print(f"  ... and {len(unresolved_ch) - 15} more", file=sys.stderr)
+
+    n_fs_skipped = len(fileset_rows) - len(to_create_fs) - len(to_update_fs)
+    print(
+        f"Filesets: {len(fileset_name_to_id)} existing, "
+        f"{len(to_create_fs)} to create, {len(to_update_fs)} to update "
+        f"{filesets_channels_field!r}+{filesets_media_field!r}"
+        + (
+            f", {n_fs_skipped} unchanged (skipped PATCH)"
+            if n_fs_skipped
+            else ""
+        )
+    )
+    if to_create_fs:
+        created_fs = create_records(
+            base_id, filesets_table, token, to_create_fs
+        )
+        merge_created_by_primary_field(
+            created_fs, filesets_name_field, fileset_name_to_id
+        )
+        for rec in created_fs:
+            rid = rec.get("id")
+            if rid:
+                fileset_id_to_fields[rid] = rec.get("fields") or {}
+        print(f"  Merged {len(created_fs)} Filesets record(s) from POST response.")
+
+    if to_update_fs:
+        update_records(base_id, filesets_table, token, to_update_fs)
+
+    # --- Cues: upsert by CUE_NUMBER (primary), orphan migration + cleanup ---
+    csv_numbers = {row["CUE_NUMBER"] for row in cue_rows}
+    cue_fetch_fields = list(
+        {
+            cue_primary_field,
+            "CUE_NAME",
+            notes_airtable_field,
+            *writable_fields,
+        }
+    )
     print("Fetching existing Cues...")
     cue_recs = list_all_records(
-        base_id, cues_table, token, fields=[cue_primary_field]
+        base_id, cues_table, token, fields=cue_fetch_fields
     )
     number_to_id: dict[str, str] = {}
+    cue_id_to_fields: dict[str, dict] = {}
     for rec in cue_recs:
         fields = rec.get("fields") or {}
-        key = fields.get(cue_primary_field)
-        if isinstance(key, str) and key.strip():
-            number_to_id[key.strip()] = rec["id"]
-        elif isinstance(key, (int, float)):
-            # Airtable may return number field types
-            number_to_id[str(key)] = rec["id"]
+        cue_id_to_fields[rec["id"]] = fields
+        pval = cue_primary_from_fields(fields, cue_primary_field)
+        if pval:
+            number_to_id[pval] = rec["id"]
 
-    to_create: list[dict] = []
-    to_update: list[tuple[str, dict]] = []
-    unresolved: list[tuple[str, str]] = []
+    orphans: list[dict] = []
+    for rec in cue_recs:
+        fields = rec.get("fields") or {}
+        pval = cue_primary_from_fields(fields, cue_primary_field)
+        if pval and pval not in csv_numbers:
+            orphans.append({"id": rec["id"], "num": pval, "fields": fields})
 
+    enriched: list[dict] = []
+    unresolved_fs: list[tuple[str, str]] = []
+    unresolved_med: list[tuple[str, str]] = []
     for row in cue_rows:
         cnum = row["CUE_NUMBER"]
-        media_ids: list[str] = []
-        for mname in parse_media_links(row["Media"]):
-            mid = name_to_id.get(mname)
-            if mid:
-                media_ids.append(mid)
+        fs_link_ids: list[str] = []
+        for fsname in parse_comma_separated_cell(row["Filesets"]):
+            fid = fileset_name_to_id.get(fsname)
+            if fid:
+                fs_link_ids.append(fid)
             else:
-                unresolved.append((cnum, mname))
-
+                unresolved_fs.append((cnum, fsname))
+        med_link_ids: list[str] = []
+        for mname in parse_comma_separated_cell(row["Media"]):
+            mid = media_name_to_id.get(mname)
+            if mid:
+                med_link_ids.append(mid)
+            else:
+                unresolved_med.append((cnum, mname))
         full_fields = {
             "Act": row["Act"],
             "CUE_NAME": row["CUE_NAME"],
-            "Media": media_ids,
+            cue_media_field: med_link_ids,
+            cue_filesets_field: fs_link_ids,
         }
+        enriched.append({"cnum": cnum, "full_fields": full_fields})
+
+    used_orphan_ids: set[str] = set()
+    to_migrate: list[tuple[str, dict]] = []
+    migrated_record_ids: set[str] = set()
+
+    for block in enriched:
+        cnum = block["cnum"]
         if cnum in number_to_id:
+            continue
+        csv_name = (block["full_fields"].get("CUE_NAME") or "").strip()
+        if not csv_name:
+            continue
+        for orb in orphans:
+            if orb["id"] in used_orphan_ids:
+                continue
+            if airtable_cue_name(orb["fields"], "CUE_NAME") != csv_name:
+                continue
+            old_num = orb["num"]
+            rid = orb["id"]
+            used_orphan_ids.add(rid)
+            migrated_record_ids.add(rid)
+            if number_to_id.get(old_num) == rid:
+                del number_to_id[old_num]
+            number_to_id[cnum] = rid
+            migrate_payload = {
+                cue_primary_field: cnum,
+                **build_patch_fields(block["full_fields"], writable_fields),
+            }
+            to_migrate.append((rid, migrate_payload))
+            print(
+                f"Migrated cue {old_num!r} -> {cnum!r} "
+                f"(matching CUE_NAME={csv_name!r})"
+            )
+            break
+
+    for orb in orphans:
+        if orb["id"] in used_orphan_ids:
+            continue
+        num = orb["num"]
+        cname = airtable_cue_name(orb["fields"], "CUE_NAME")
+        if notes_field_nonempty(orb["fields"], notes_airtable_field):
+            disp = cname if cname else "(empty)"
+            print(
+                f"Keeping removed cue number {num!r} (CUE_NAME={disp!r}) — "
+                f"{notes_airtable_field!r} is not empty; not deleting."
+            )
+
+    orphans_to_delete = [
+        orb
+        for orb in orphans
+        if orb["id"] not in used_orphan_ids
+        and not notes_field_nonempty(orb["fields"], notes_airtable_field)
+    ]
+
+    if to_migrate:
+        print(f"Cues: applying {len(to_migrate)} migration(s) (primary + fields)")
+        update_records(base_id, cues_table, token, to_migrate)
+
+    for orb in orphans_to_delete:
+        num = orb["num"]
+        cname = airtable_cue_name(orb["fields"], "CUE_NAME")
+        disp = cname if cname else "(empty)"
+        print(f"Deleting orphaned cue {num!r} (CUE_NAME={disp!r})")
+        delete_record(base_id, cues_table, token, orb["id"])
+
+    to_create: list[dict] = []
+    to_update: list[tuple[str, dict]] = []
+    cue_patch_skipped = 0
+
+    for block in enriched:
+        cnum = block["cnum"]
+        full_fields = block["full_fields"]
+        if cnum in number_to_id:
+            rid = number_to_id[cnum]
+            if rid in migrated_record_ids:
+                continue
             patch = build_patch_fields(full_fields, writable_fields)
-            to_update.append((number_to_id[cnum], patch))
+            ex = cue_id_to_fields.get(rid, {})
+            if patch_redundant_with_existing(ex, patch):
+                cue_patch_skipped += 1
+            else:
+                to_update.append((rid, patch))
         else:
             new_f = {cue_primary_field: cnum, **full_fields}
             to_create.append(new_f)
@@ -325,16 +775,49 @@ def main() -> None:
     if skipped_cues:
         print(f"Skipped {skipped_cues} cue row(s) with empty CUE_NUMBER in CSV.")
 
-    if unresolved:
-        print("WARNING: missing Media rows for some links (skipped those links):", file=sys.stderr)
-        for cnum, mn in unresolved[:15]:
-            print(f"  CUE_NUMBER={cnum!r} missing Media Name={mn!r}", file=sys.stderr)
-        if len(unresolved) > 15:
-            print(f"  ... and {len(unresolved) - 15} more", file=sys.stderr)
+    if unresolved_fs:
+        print(
+            "WARNING: missing Filesets rows for some cue links (skipped those links):",
+            file=sys.stderr,
+        )
+        for cnum, fn in unresolved_fs[:15]:
+            print(
+                f"  CUE_NUMBER={cnum!r} missing Fileset Name={fn!r}",
+                file=sys.stderr,
+            )
+        if len(unresolved_fs) > 15:
+            print(f"  ... and {len(unresolved_fs) - 15} more", file=sys.stderr)
 
-    print(f"Cues: {len(to_create)} to create, {len(to_update)} to update")
+    if unresolved_med:
+        print(
+            "WARNING: missing Media rows for some cue links (skipped those links):",
+            file=sys.stderr,
+        )
+        for cnum, mn in unresolved_med[:15]:
+            print(
+                f"  CUE_NUMBER={cnum!r} missing Media Name={mn!r}",
+                file=sys.stderr,
+            )
+        if len(unresolved_med) > 15:
+            print(f"  ... and {len(unresolved_med) - 15} more", file=sys.stderr)
+
+    print(
+        f"Cues: {len(to_create)} to create, {len(to_update)} to update"
+        + (
+            f", {cue_patch_skipped} unchanged (skipped PATCH)"
+            if cue_patch_skipped
+            else ""
+        )
+    )
     if to_create:
-        create_records(base_id, cues_table, token, to_create)
+        created_cues = create_records(base_id, cues_table, token, to_create)
+        merge_created_by_primary_field(
+            created_cues,
+            cue_primary_field,
+            number_to_id,
+            primary_reader=cue_primary_from_fields,
+        )
+        print(f"  Merged {len(created_cues)} Cues record(s) from POST response.")
     if to_update:
         update_records(base_id, cues_table, token, to_update)
 

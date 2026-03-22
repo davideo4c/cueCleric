@@ -12,8 +12,12 @@ This writes:
 
 | File | Purpose |
 |------|---------|
-| `exports/media.csv` | One row per unique media file. Column **`Name`** = primary field in Airtable (must match link text exactly). |
-| `exports/cues.csv` | One row per cue that has a **non-empty `CUE_NUMBER`** (from the cue tag). Columns: **`CUE_NUMBER`**, **`Act`**, **`CUE_NAME`**, **`Media`** (comma-separated `Name` values, no spaces after commas). |
+| `exports/media.csv` | One row per unique **media file** (verbose Disguise filename + optional `v###`). **`Name`** = primary — human-readable, per-file identity. |
+| `exports/channels.csv` | One row per unique **channel** code. **`Name`** = primary (e.g. `C01`, `C21`, `C01B`). |
+| `exports/filesets.csv` | **`Name`** = fileset key; **`Channels`** = comma-separated channel **`Name`**s (→ **Channels**); **`Media`** = comma-separated **`Media.Name`** values for every file in that fileset. |
+| `exports/cues.csv` | **`CUE_NUMBER`**, **`Act`**, **`CUE_NAME`**, **`Media`** (comma-separated **`Media.Name`** — verbose), **`Filesets`** (comma-separated **Filesets.Name** — grouped). |
+
+**File naming:** Assets like `000-021-c11-grids_and_guides.mov` parse as `NNN-NNN-<channel>-<description>`. The fileset key is `000-021-grids_and_guides`. **Cues** get both **Media** (actual files) and **Filesets** (logical groups).
 
 **Omitted from `cues.csv`:** cues with no tag / empty computed `CUE_NUMBER` (count is printed when you export).
 
@@ -33,7 +37,22 @@ python3 export_cues_csv.py --combined-out exports/cues_with_videos.csv
 
 | Field | Type | Notes |
 |-------|------|--------|
-| **Name** | Primary field (Single line text) | Must match the `Name` column in `media.csv`. |
+| **Name** | Primary field (Single line text) | Full filename string from `media.csv` (must match **Cues.Media** and **Filesets.Media** link text). |
+
+### Table **Channels**
+
+| Field | Type | Notes |
+|-------|------|--------|
+| **Name** | Primary field (Single line text) | Channel code, e.g. `C02`, `C21`. Must match `channels.csv` and **Filesets.Channels** link text. |
+
+### Table **Filesets**
+
+| Field | Type | Notes |
+|-------|------|--------|
+| **Name** | Primary field (Single line text) | Must match `filesets.csv` (e.g. `000-021-grids_and_guides`). |
+| **Channels** | **Link to another record** → Channels | Allow **multiple**. Updated by `push_airtable.py`. |
+| **Media** | **Link to another record** → Media | Allow **multiple** — all media files that belong to this fileset. Updated by script. |
+| **Cues** | *(inverse link)* | When you add **Filesets** on **Cues** (below), Airtable adds a reverse linked field on **Filesets** (often named **Cues**). **You do not PATCH this from the script** — it fills automatically from **Cues → Filesets**. |
 
 ### Table **Cues**
 
@@ -42,13 +61,14 @@ python3 export_cues_csv.py --combined-out exports/cues_with_videos.csv
 | **CUE_NUMBER** | **Primary field** (Single line text) | Computed decimal from tag, e.g. `26.5`. Globally unique. |
 | **Act** | Single line text (or Single select) | Updated by `push_airtable.py`. |
 | **CUE_NAME** | Single line text | Updated by script. |
-| **Media** | **Link to another record** → Media | Allow **multiple** links. Updated by script. |
+| **Media** | **Link to another record** → Media | Allow **multiple** — verbose list of files for this cue. |
+| **Filesets** | **Link to another record** → Filesets | Allow **multiple** — grouped filesets for this cue. |
 | **Description** | Single line text | Manual only — **not** written by the script. |
 | **Call** | Single line text | Manual only — **not** written by the script. |
 | **Page number** | Single line text | Manual only — **not** written by the script. |
 | **Notes** | Link to **Notes** table (or your notes table) | Manual only — **not** written by the script. |
 
-Field names for script-managed columns must match **`Act`**, **`CUE_NAME`**, **`Media`** exactly (or set env overrides for Media; see below).
+Field names for script-managed columns must match **`Act`**, **`CUE_NAME`**, **`Media`**, **`Filesets`** (or set env overrides; see below).
 
 ---
 
@@ -56,8 +76,10 @@ Field names for script-managed columns must match **`Act`**, **`CUE_NAME`**, **`
 
 If you prefer the UI over the API:
 
-1. Import **`media.csv`** into the **Media** table (map `Name` → primary).
-2. Import **`cues.csv`** into **Cues**; map **`Media`** to the linked field. Airtable resolves links by **primary field** (`Name`).
+1. Import **`media.csv`** into **Media** (`Name` → primary).
+2. Import **`channels.csv`** into **Channels** (`Name` → primary).
+3. Import **`filesets.csv`** into **Filesets** (`Name` → primary; **`Channels`** → link → **Channels**; **`Media`** → link → **Media**).
+4. Import **`cues.csv`** into **Cues** (**`Media`** → **Media**; **`Filesets`** → **Filesets**).
 
 ---
 
@@ -85,10 +107,19 @@ Optional overrides:
 | Variable | Default |
 |----------|---------|
 | `AIRTABLE_MEDIA_TABLE` | `Media` |
-| `AIRTABLE_CUES_TABLE` | `Cues` |
 | `AIRTABLE_MEDIA_NAME_FIELD` | `Name` |
+| `AIRTABLE_CHANNELS_TABLE` | `Channels` |
+| `AIRTABLE_CHANNELS_NAME_FIELD` | `Name` |
+| `AIRTABLE_FILESETS_TABLE` | `Filesets` |
+| `AIRTABLE_FILESETS_NAME_FIELD` | `Name` |
+| `AIRTABLE_FILESETS_CHANNELS_FIELD` | `Channels` (Filesets → Channels) |
+| `AIRTABLE_FILESETS_MEDIA_FIELD` | `Media` (Filesets → Media) |
+| `AIRTABLE_CUES_TABLE` | `Cues` |
+| `AIRTABLE_CUE_MEDIA_FIELD` | `Media` (Cues → Media) |
+| `AIRTABLE_CUE_FILESETS_FIELD` | `Filesets` |
 | `AIRTABLE_CUE_PRIMARY_FIELD` | `CUE_NUMBER` |
-| `AIRTABLE_CUE_WRITABLE_FIELDS` | `Act,CUE_NAME,Media` (fields included in **PATCH** only; primary is never PATCHed) |
+| `AIRTABLE_CUE_WRITABLE_FIELDS` | `Act,CUE_NAME,Media,Filesets` |
+| `AIRTABLE_CUE_NOTES_FIELD` | `Notes` (orphan cleanup) |
 
 ### Sync
 
@@ -100,16 +131,21 @@ python3 push_airtable.py
 
 What **`push_airtable.py`** does:
 
-1. Ensures every **Media** `Name` from `media.csv` exists (creates missing rows in batches of 10).
-2. For each **Cue** in `cues.csv` (non-empty `CUE_NUMBER` only):
-   - If **`CUE_NUMBER`** already exists → **PATCH** with **only** `Act`, `CUE_NAME`, `Media` (same set as `AIRTABLE_CUE_WRITABLE_FIELDS`). **Description**, **Call**, **Page number**, **Notes** are never sent.
-   - Else → **POST** with **`CUE_NUMBER`** (primary) + `Act` + `CUE_NAME` + `Media`.
+1. **Media:** Ensures every **`Name`** from `media.csv` (plus names referenced on **Filesets** / **Cues** rows) exists in **Media**.
+2. **Channels:** Ensures every channel **`Name`** from `channels.csv` (plus codes in **Filesets**) exists in **Channels**.
+3. **Filesets:** For each `filesets.csv` row, **POST** or **PATCH** **`Channels`** and **`Media`** link fields (record IDs from channel codes and **Media.Name**).
+4. **Cue orphans** (in Airtable but not in `cues.csv`): same as before — name-matched **migration** of primary **`CUE_NUMBER`**, else keep if **Notes** set or **delete**.
+5. **Cues:** **POST**/**PATCH** with `Act`, `CUE_NAME`, **`Media`**, **`Filesets`** (per `AIRTABLE_CUE_WRITABLE_FIELDS`).
 
-Media links are sent as **record IDs** resolved from the `Name` → `record id` map.
+**Links** use **record IDs** resolved from primary **`Name`** strings. **Cues that use a fileset** appear on **Filesets** via Airtable’s **inverse** of **Cues.Filesets** (name that field e.g. **Cues** in the UI); the script only writes **Cues → Filesets**, not the reverse.
 
-### Migrating from `Cue_Key`
+**API usage:** **Filesets** and **Cues** are **PATCH**ed only when linked fields or writable text differ from what was read at the start of the run (no-op rows are skipped). After **POST** creates, new record **ids** are taken from the **create response** instead of re-listing the whole table.
 
-If you used an older schema with **`Cue_Key`**, remove that field from Airtable (or ignore it), set **CUE_NUMBER** as primary, and re-import or let the script **create** new rows. Existing rows keyed only by `Cue_Key` will not match until **`CUE_NUMBER`** values align.
+**Notes:** Migration by name is only attempted when the CSV **`CUE_NAME`** is non-empty, so cues with blank names are never matched to an orphan for primary reassignment.
+
+### Migrating older bases
+
+Add **Media**, **Channels**, link fields **Filesets.Channels**, **Filesets.Media**, **Cues.Media**, **Cues.Filesets**, then re-export and push (or import the four CSVs in order: media, channels, filesets, cues).
 
 ### Rate limits
 
@@ -118,8 +154,8 @@ The script sleeps ~0.22s between requests. Large bases may take a few minutes on
 ### Troubleshooting
 
 - **HTTP 403/401**: Token scopes or base access.
-- **Unknown field name**: Rename Airtable fields to match the tables above, or set `AIRTABLE_MEDIA_NAME_FIELD` / `AIRTABLE_CUE_PRIMARY_FIELD` if those differ.
-- **Links missing**: `Media` cell in CSV must use the **exact** same string as `Media.Name`. Check warnings printed for unresolved names.
+- **Unknown field name**: Rename fields or set `AIRTABLE_MEDIA_*` / `AIRTABLE_CHANNELS_*` / `AIRTABLE_FILESETS_*` / `AIRTABLE_CUE_*` env vars.
+- **Links missing**: **Media.Name** / **Channels.Name** / **Filesets.Name** must match CSV cells exactly. Check stderr warnings.
 
 ---
 
