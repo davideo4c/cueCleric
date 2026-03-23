@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Push exports/media.csv, channels.csv, filesets.csv, and cues.csv to Airtable via the REST API.
+Push channels.csv, filesets.csv, and cues.csv to Airtable via the REST API.
+
+By default the **Media** table is **not** synced (set AIRTABLE_SYNC_MEDIA=1 to opt in and
+supply exports/media.csv).
 
 Prerequisites:
   1. Run: python3 export_cues_csv.py
@@ -12,20 +15,13 @@ Environment variables:
   AIRTABLE_BASE_ID     Required. Base ID (starts with app...)
 
 Optional:
+  AIRTABLE_SYNC_MEDIA               If 1/true/yes/on, sync Media table (requires media.csv)
   AIRTABLE_MEDIA_TABLE              Default: Media
-  AIRTABLE_MEDIA_NAME_FIELD         Primary on Media. Default: Name
+  ... (other AIRTABLE_MEDIA_* when sync enabled)
   AIRTABLE_CHANNELS_TABLE           Default: Channels
-  AIRTABLE_CHANNELS_NAME_FIELD      Primary on Channels. Default: Name
-  AIRTABLE_FILESETS_TABLE           Default: Filesets
-  AIRTABLE_FILESETS_NAME_FIELD      Primary on Filesets. Default: Name
-  AIRTABLE_FILESETS_CHANNELS_FIELD  Filesets → Channels (multiple). Default: Channels
-  AIRTABLE_FILESETS_MEDIA_FIELD     Filesets → Media (multiple). Default: Media
-  AIRTABLE_CUES_TABLE               Default: Cues
-  AIRTABLE_CUE_MEDIA_FIELD          Cues → Media (multiple). Default: Media
-  AIRTABLE_CUE_FILESETS_FIELD       Cues → Filesets (multiple). Default: Filesets
-  AIRTABLE_CUE_PRIMARY_FIELD        Primary on Cues (CUE_NUMBER). Default: CUE_NUMBER
-  AIRTABLE_CUE_WRITABLE_FIELDS      Default: Track,CUE_NAME,Media,Filesets
-  AIRTABLE_CUE_NOTES_FIELD          Orphan retention. Default: Notes
+  AIRTABLE_FILESETS_CHANNEL_VERSIONS_FIELD  Single line text on Filesets. Default: Channel versions
+  AIRTABLE_FILESETS_WRITABLE_FIELDS Default: Channels,Used in show,Channel versions (Media omitted)
+  AIRTABLE_CUE_WRITABLE_FIELDS      Default: Track,CUE_NAME,Filesets (add Media to sync/clear links)
 
 Usage:
   export AIRTABLE_TOKEN=pat...
@@ -33,9 +29,8 @@ Usage:
   python3 push_airtable.py --dry-run
   python3 push_airtable.py
 
-  python3 push_airtable.py --media-csv exports/media.csv \\
-      --channels-csv exports/channels.csv --filesets-csv exports/filesets.csv \\
-      --cues-csv exports/cues.csv
+  python3 push_airtable.py --channels-csv exports/channels.csv \\
+      --filesets-csv exports/filesets.csv --cues-csv exports/cues.csv
 """
 
 from __future__ import annotations
@@ -196,6 +191,20 @@ def airtable_field_matches_desired(existing_val, desired_val) -> bool:
         return normalized_link_ids(existing_val) == tuple(
             sorted(str(x) for x in desired_val)
         )
+    if isinstance(desired_val, bool):
+        if existing_val is None:
+            ex_b = False
+        else:
+            ex_b = bool(existing_val)
+        return ex_b == desired_val
+    if isinstance(desired_val, int) and not isinstance(desired_val, bool):
+        if existing_val is None:
+            return False
+        try:
+            ex_n = int(existing_val)
+        except (TypeError, ValueError):
+            return False
+        return ex_n == desired_val
     return normalized_scalar(existing_val) == normalized_scalar(desired_val)
 
 
@@ -230,18 +239,59 @@ def delete_record(base_id: str, table: str, token: str, record_id: str) -> None:
     api_request("DELETE", url, token, None)
 
 
-def read_media_csv(path: Path) -> list[str]:
-    """Media Names from media.csv (primary)."""
-    names: list[str] = []
+def parse_csv_bool(cell: str | None) -> bool | None:
+    """CSV checkbox columns: TRUE/FALSE (and a few aliases). Unknown → None."""
+    s = (cell or "").strip().lower()
+    if s in ("true", "1", "yes", "y", "t"):
+        return True
+    if s in ("false", "0", "no", "n", "f", ""):
+        return False
+    return None
+
+
+def read_media_csv(path: Path) -> tuple[list[dict[str, str]], frozenset[str]]:
+    """
+    Rows from media.csv (Name required). Returns (rows, column names present).
+    Optional columns: Version, Used in show, On disk.
+    """
+    rows: list[dict[str, str]] = []
     with path.open(encoding="utf-8", newline="") as f:
         r = csv.DictReader(f)
         if not r.fieldnames or "Name" not in r.fieldnames:
             raise SystemExit(f"{path}: need a 'Name' column")
+        cols = frozenset(x.strip() for x in r.fieldnames if x and x.strip())
         for row in r:
             n = (row.get("Name") or "").strip()
             if n:
-                names.append(n)
-    return names
+                rows.append(dict(row))
+    return rows, cols
+
+
+def media_extra_fields_from_row(
+    row: dict[str, str],
+    csv_cols: frozenset[str],
+    writable_airtable_fields: list[str],
+    version_field: str,
+    used_field: str,
+    on_disk_field: str,
+) -> dict:
+    """Subset of Airtable Media fields derived from one CSV row (writable only)."""
+    patch: dict = {}
+    if version_field in writable_airtable_fields and "Version" in csv_cols:
+        v = (row.get("Version") or "").strip()
+        if v.isdigit():
+            patch[version_field] = int(v)
+        elif v:
+            patch[version_field] = v
+    if used_field in writable_airtable_fields and "Used in show" in csv_cols:
+        b = parse_csv_bool(row.get("Used in show"))
+        if b is not None:
+            patch[used_field] = b
+    if on_disk_field in writable_airtable_fields and "On disk" in csv_cols:
+        b2 = parse_csv_bool(row.get("On disk"))
+        if b2 is not None:
+            patch[on_disk_field] = b2
+    return patch
 
 
 def read_channels_csv(path: Path) -> list[str]:
@@ -258,23 +308,35 @@ def read_channels_csv(path: Path) -> list[str]:
     return names
 
 
-def read_filesets_csv(path: Path) -> list[dict[str, str]]:
-    """Rows from filesets.csv: Name, Channels, Media (comma-separated link names)."""
-    out: list[dict[str, str]] = []
-    required = {"Name", "Channels", "Media"}
+def read_filesets_csv(path: Path) -> list[dict[str, str | bool | None]]:
+    """Rows from filesets.csv: Name, Channels; optional Channel versions, Used in show."""
+    out: list[dict[str, str | bool | None]] = []
+    required = {"Name", "Channels"}
     with path.open(encoding="utf-8", newline="") as f:
         r = csv.DictReader(f)
-        if not r.fieldnames or not required.issubset(set(r.fieldnames)):
+        fn = set(r.fieldnames or [])
+        if not required.issubset(fn):
             raise SystemExit(f"{path}: need columns {sorted(required)}")
+        has_used_col = "Used in show" in fn
+        has_cv_col = "Channel versions" in fn
         for row in r:
             name = (row.get("Name") or "").strip()
             if not name:
                 continue
+            used_val: bool | None
+            if has_used_col:
+                used_val = parse_csv_bool(row.get("Used in show"))
+            else:
+                used_val = None
+            cv_cell = (row.get("Channel versions") or "").strip() if has_cv_col else ""
             out.append(
                 {
                     "Name": name,
                     "Channels": (row.get("Channels") or "").strip(),
-                    "Media": (row.get("Media") or "").strip(),
+                    "Channel versions": cv_cell,
+                    "_has_channel_versions_csv": has_cv_col,
+                    "_has_used_in_show_csv": has_used_col,
+                    "_used_in_show": used_val,
                 }
             )
     return out
@@ -284,13 +346,15 @@ def read_cues_csv(path: Path) -> tuple[list[dict[str, str]], int]:
     """Return (rows with non-empty CUE_NUMBER, count of skipped empty rows)."""
     rows: list[dict[str, str]] = []
     skipped_empty = 0
-    required = {"CUE_NUMBER", "Track", "CUE_NAME", "Media", "Filesets"}
+    required = {"CUE_NUMBER", "Track", "CUE_NAME", "Filesets"}
     with path.open(encoding="utf-8", newline="") as f:
         r = csv.DictReader(f)
-        if not r.fieldnames or not required.issubset(set(r.fieldnames)):
+        fn = set(r.fieldnames or [])
+        if not r.fieldnames or not required.issubset(fn):
             raise SystemExit(f"{path}: need columns {sorted(required)}")
         for row in r:
             rec = {k: (row.get(k) or "").strip() for k in required}
+            rec["Media"] = (row.get("Media") or "").strip() if "Media" in fn else ""
             if not rec["CUE_NUMBER"]:
                 skipped_empty += 1
                 continue
@@ -307,8 +371,12 @@ def parse_comma_separated_cell(cell: str) -> list[str]:
 
 def parse_writable_fields(env_val: str) -> list[str]:
     """Fields allowed on PATCH (must not include manual-only fields)."""
-    raw = (env_val or "Track,CUE_NAME,Media,Filesets").strip()
+    raw = (env_val or "Track,CUE_NAME,Filesets").strip()
     return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def env_flag_true(val: str | None) -> bool:
+    return (val or "").strip().lower() in ("1", "true", "yes", "on", "y")
 
 
 def build_patch_fields(
@@ -366,8 +434,24 @@ def main() -> None:
 
     token = os.environ.get("AIRTABLE_TOKEN", "").strip()
     base_id = os.environ.get("AIRTABLE_BASE_ID", "").strip()
+    sync_media = env_flag_true(os.environ.get("AIRTABLE_SYNC_MEDIA"))
     media_table = os.environ.get("AIRTABLE_MEDIA_TABLE", "Media").strip()
     media_name_field = os.environ.get("AIRTABLE_MEDIA_NAME_FIELD", "Name").strip()
+    media_version_field = os.environ.get(
+        "AIRTABLE_MEDIA_VERSION_FIELD", "Version"
+    ).strip()
+    media_used_field = os.environ.get(
+        "AIRTABLE_MEDIA_USED_FIELD", "Used in show"
+    ).strip()
+    media_on_disk_field = os.environ.get(
+        "AIRTABLE_MEDIA_ON_DISK_FIELD", "On disk"
+    ).strip()
+    _mw = os.environ.get("AIRTABLE_MEDIA_WRITABLE_FIELDS", "").strip()
+    if not _mw:
+        media_writable_fields = ["Version", "Used in show", "On disk"]
+    else:
+        media_writable_fields = [x.strip() for x in _mw.split(",") if x.strip()]
+    media_writable_fields = [f for f in media_writable_fields if f != media_name_field]
     channels_table = os.environ.get("AIRTABLE_CHANNELS_TABLE", "Channels").strip()
     channels_name_field = os.environ.get(
         "AIRTABLE_CHANNELS_NAME_FIELD", "Name"
@@ -382,6 +466,22 @@ def main() -> None:
     filesets_media_field = os.environ.get(
         "AIRTABLE_FILESETS_MEDIA_FIELD", "Media"
     ).strip()
+    filesets_used_field = os.environ.get(
+        "AIRTABLE_FILESETS_USED_FIELD", "Used in show"
+    ).strip()
+    filesets_channel_versions_field = os.environ.get(
+        "AIRTABLE_FILESETS_CHANNEL_VERSIONS_FIELD", "Channel versions"
+    ).strip()
+    _fw = os.environ.get("AIRTABLE_FILESETS_WRITABLE_FIELDS", "").strip()
+    if not _fw:
+        # Do not PATCH/POST Filesets.Media by default — empty [] often 422s or is unwanted.
+        filesets_writable_fields = [
+            "Channels",
+            "Used in show",
+            filesets_channel_versions_field,
+        ]
+    else:
+        filesets_writable_fields = [x.strip() for x in _fw.split(",") if x.strip()]
     cues_table = os.environ.get("AIRTABLE_CUES_TABLE", "Cues").strip()
     cue_media_field = os.environ.get("AIRTABLE_CUE_MEDIA_FIELD", "Media").strip()
     cue_filesets_field = os.environ.get(
@@ -413,92 +513,170 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    if (
-        not args.media_csv.is_file()
-        or not args.channels_csv.is_file()
-        or not args.filesets_csv.is_file()
-        or not args.cues_csv.is_file()
-    ):
+    missing_inputs: list[str] = []
+    if sync_media and not args.media_csv.is_file():
+        missing_inputs.append(str(args.media_csv))
+    if not args.channels_csv.is_file():
+        missing_inputs.append(str(args.channels_csv))
+    if not args.filesets_csv.is_file():
+        missing_inputs.append(str(args.filesets_csv))
+    if not args.cues_csv.is_file():
+        missing_inputs.append(str(args.cues_csv))
+    if missing_inputs:
         print(
-            "Run export_cues_csv.py first, or pass --media-csv / --channels-csv / "
-            "--filesets-csv / --cues-csv.",
+            "Missing CSV(s): " + "; ".join(missing_inputs),
+            file=sys.stderr,
+        )
+        print(
+            "Run export_cues_csv.py first, or pass --channels-csv / --filesets-csv / "
+            "--cues-csv. Set AIRTABLE_SYNC_MEDIA=1 only if you also supply media.csv.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    media_names = read_media_csv(args.media_csv)
+    media_by_name: dict[str, dict[str, str]] = {}
+    media_csv_cols: frozenset[str] = frozenset()
+    if sync_media:
+        media_rows, media_csv_cols = read_media_csv(args.media_csv)
+        for r in media_rows:
+            n = (r.get("Name") or "").strip()
+            if n:
+                media_by_name[n] = r
     channel_names = read_channels_csv(args.channels_csv)
     fileset_rows = read_filesets_csv(args.filesets_csv)
     cue_rows, skipped_cues = read_cues_csv(args.cues_csv)
 
     needed_channel_codes: set[str] = set(channel_names)
     for fr in fileset_rows:
-        needed_channel_codes.update(parse_comma_separated_cell(fr["Channels"]))
+        needed_channel_codes.update(
+            parse_comma_separated_cell(str(fr["Channels"]))
+        )
 
-    needed_media_names: set[str] = set(media_names)
-    for fr in fileset_rows:
-        needed_media_names.update(parse_comma_separated_cell(fr["Media"]))
-    for cr in cue_rows:
-        needed_media_names.update(parse_comma_separated_cell(cr["Media"]))
+    needed_media_names: set[str] = set(media_by_name.keys())
+    if sync_media:
+        for cr in cue_rows:
+            needed_media_names.update(parse_comma_separated_cell(cr["Media"]))
 
     if args.dry_run:
         print(
-            f"Would sync {len(needed_media_names)} Media, "
-            f"{len(needed_channel_codes)} Channels, "
+            f"Would sync {len(needed_channel_codes)} Channels, "
             f"{len(fileset_rows)} Filesets, {len(cue_rows)} Cues"
         )
+        if sync_media:
+            print(f"  (Also Media: {len(needed_media_names)} names — AIRTABLE_SYNC_MEDIA is on)")
+        else:
+            print("  (Media table skipped — set AIRTABLE_SYNC_MEDIA=1 + media.csv to enable)")
         if skipped_cues:
             print(f"  (Skipped {skipped_cues} cue rows with empty CUE_NUMBER in CSV)")
         print(f"  Base: {base_id or '(not set)'}")
         print(
-            f"  Tables: {media_table!r}, {channels_table!r}, "
-            f"{filesets_table!r}, {cues_table!r}"
+            f"  Tables: {channels_table!r}, {filesets_table!r}, {cues_table!r}"
+            + (f", {media_table!r}" if sync_media else "")
         )
-        print(f"  Media primary field: {media_name_field!r}")
         print(f"  Channels primary field: {channels_name_field!r}")
         print(
             f"  Filesets.{filesets_channels_field!r} → {channels_table!r}; "
-            f"Filesets.{filesets_media_field!r} → {media_table!r}"
+            f"text field {filesets_channel_versions_field!r}"
         )
         print(f"  Filesets primary field: {filesets_name_field!r}")
         print(
-            f"  Cues.{cue_media_field!r} → {media_table!r}; "
-            f"Cues.{cue_filesets_field!r} → {filesets_table!r}"
+            f"  Cues.{cue_filesets_field!r} → {filesets_table!r}"
+            + (
+                f"; Cues.{cue_media_field!r} (linked records)"
+                if cue_media_field in writable_fields
+                else ""
+            )
         )
         print(f"  Cues primary field: {cue_primary_field!r}")
-        print(f"  PATCH fields only: {writable_fields}")
+        print(f"  Cues PATCH fields only: {writable_fields}")
+        if sync_media:
+            print(f"  Media PATCH fields: {media_writable_fields}")
+        print(f"  Filesets PATCH fields: {filesets_writable_fields}")
         print(
             f"  Orphan cleanup: name-matched primary migration; "
             f"keep if {notes_airtable_field!r} non-empty else delete"
         )
         return
 
-    # --- Media: ensure every Name exists (Cues + Filesets link targets) ---
-    print("Fetching existing Media records...")
-    media_recs = list_all_records(
-        base_id, media_table, token, fields=[media_name_field]
-    )
     media_name_to_id: dict[str, str] = {}
-    for rec in media_recs:
-        rid = rec["id"]
-        fields = rec.get("fields") or {}
-        val = fields.get(media_name_field)
-        if isinstance(val, str) and val.strip():
-            media_name_to_id[val.strip()] = rid
+    media_id_to_fields: dict[str, dict] = {}
 
-    missing_media = sorted(needed_media_names - set(media_name_to_id.keys()))
-    print(f"Media: {len(media_name_to_id)} existing, {len(missing_media)} to create")
-    if missing_media:
-        created_m = create_records(
-            base_id,
-            media_table,
-            token,
-            [{media_name_field: n} for n in missing_media],
+    if sync_media:
+        # --- Media: ensure every Name exists (cue link targets when CSV lists Media) ---
+        print("Fetching existing Media records...")
+        media_fetch_fields = [media_name_field, *media_writable_fields]
+        media_fetch_fields = list(dict.fromkeys(f for f in media_fetch_fields if f))
+        media_recs = list_all_records(
+            base_id, media_table, token, fields=media_fetch_fields
         )
-        merge_created_by_primary_field(
-            created_m, media_name_field, media_name_to_id
-        )
-        print(f"  Merged {len(created_m)} Media record(s) from POST response.")
+        for rec in media_recs:
+            rid = rec["id"]
+            fields = rec.get("fields") or {}
+            media_id_to_fields[rid] = fields
+            val = fields.get(media_name_field)
+            if isinstance(val, str) and val.strip():
+                media_name_to_id[val.strip()] = rid
+
+        missing_media = sorted(needed_media_names - set(media_name_to_id.keys()))
+        print(f"Media: {len(media_name_to_id)} existing, {len(missing_media)} to create")
+        if missing_media:
+            create_payloads: list[dict] = []
+            for n in missing_media:
+                row = media_by_name.get(n, {})
+                flds: dict = {media_name_field: n}
+                flds.update(
+                    media_extra_fields_from_row(
+                        row,
+                        media_csv_cols,
+                        media_writable_fields,
+                        media_version_field,
+                        media_used_field,
+                        media_on_disk_field,
+                    )
+                )
+                create_payloads.append(flds)
+            created_m = create_records(base_id, media_table, token, create_payloads)
+            merge_created_by_primary_field(
+                created_m, media_name_field, media_name_to_id
+            )
+            for rec in created_m:
+                rid = rec.get("id")
+                if rid:
+                    media_id_to_fields[rid] = rec.get("fields") or {}
+            print(f"  Merged {len(created_m)} Media record(s) from POST response.")
+
+        to_update_media: list[tuple[str, dict]] = []
+        media_patch_skipped = 0
+        for n in sorted(needed_media_names):
+            rid = media_name_to_id.get(n)
+            if not rid:
+                continue
+            row = media_by_name.get(n, {})
+            patch = media_extra_fields_from_row(
+                row,
+                media_csv_cols,
+                media_writable_fields,
+                media_version_field,
+                media_used_field,
+                media_on_disk_field,
+            )
+            if not patch:
+                continue
+            ex = media_id_to_fields.get(rid, {})
+            if patch_redundant_with_existing(ex, patch):
+                media_patch_skipped += 1
+            else:
+                to_update_media.append((rid, patch))
+        if to_update_media:
+            print(
+                f"Media: {len(to_update_media)} to update "
+                f"({media_patch_skipped} unchanged skipped PATCH)"
+            )
+            update_records(base_id, media_table, token, to_update_media)
+        elif media_patch_skipped:
+            print(f"Media: {media_patch_skipped} unchanged (skipped PATCH)")
+    else:
+        print("Skipping Media table (AIRTABLE_SYNC_MEDIA not set).")
 
     # --- Channels: ensure every Name exists (Filesets link targets) ---
     print("Fetching existing Channels records...")
@@ -527,11 +705,16 @@ def main() -> None:
         )
         print(f"  Merged {len(created_ch)} Channels record(s) from POST response.")
 
-    # --- Filesets: upsert Name + Channels + Media (linked record IDs) ---
+    # --- Filesets: upsert Channels, Used in show, Channel versions (Media only if writable) ---
     print("Fetching existing Filesets records...")
-    fs_fetch_fields = list(
-        {filesets_name_field, filesets_channels_field, filesets_media_field}
-    )
+    fs_fetch_fields = [filesets_name_field, filesets_channels_field]
+    if filesets_media_field in filesets_writable_fields:
+        fs_fetch_fields.append(filesets_media_field)
+    if filesets_used_field in filesets_writable_fields:
+        fs_fetch_fields.append(filesets_used_field)
+    if filesets_channel_versions_field in filesets_writable_fields:
+        fs_fetch_fields.append(filesets_channel_versions_field)
+    fs_fetch_fields = list(dict.fromkeys(fs_fetch_fields))
     fileset_recs = list_all_records(
         base_id, filesets_table, token, fields=fs_fetch_fields
     )
@@ -548,7 +731,6 @@ def main() -> None:
     to_create_fs: list[dict] = []
     to_update_fs: list[tuple[str, dict]] = []
     unresolved_ch: list[tuple[str, str]] = []
-    unresolved_fs_media: list[tuple[str, str]] = []
     for fr in fileset_rows:
         n = fr["Name"]
         ch_link_ids: list[str] = []
@@ -558,17 +740,26 @@ def main() -> None:
                 ch_link_ids.append(cid)
             else:
                 unresolved_ch.append((n, code))
-        med_link_ids: list[str] = []
-        for mname in parse_comma_separated_cell(fr["Media"]):
-            mid = media_name_to_id.get(mname)
-            if mid:
-                med_link_ids.append(mid)
-            else:
-                unresolved_fs_media.append((n, mname))
-        body = {
-            filesets_channels_field: ch_link_ids,
-            filesets_media_field: med_link_ids,
-        }
+        body: dict = {}
+        if filesets_channels_field in filesets_writable_fields:
+            body[filesets_channels_field] = ch_link_ids
+        if filesets_media_field in filesets_writable_fields:
+            body[filesets_media_field] = []
+        if (
+            filesets_used_field in filesets_writable_fields
+            and fr.get("_has_used_in_show_csv")
+        ):
+            u = fr.get("_used_in_show")
+            if u is not None:
+                body[filesets_used_field] = u
+        if (
+            filesets_channel_versions_field in filesets_writable_fields
+            and fr.get("_has_channel_versions_csv")
+        ):
+            cv = fr.get("Channel versions")
+            body[filesets_channel_versions_field] = (
+                cv if isinstance(cv, str) else (cv or "")
+            )
         if n in fileset_name_to_id:
             rid = fileset_name_to_id[n]
             ex = fileset_id_to_fields.get(rid, {})
@@ -576,19 +767,6 @@ def main() -> None:
                 to_update_fs.append((rid, body))
         else:
             to_create_fs.append({filesets_name_field: n, **body})
-
-    if unresolved_fs_media:
-        print(
-            "WARNING: missing Media rows for some filesets (skipped those links):",
-            file=sys.stderr,
-        )
-        for fsname, mn in unresolved_fs_media[:15]:
-            print(
-                f"  Fileset={fsname!r} missing Media Name={mn!r}",
-                file=sys.stderr,
-            )
-        if len(unresolved_fs_media) > 15:
-            print(f"  ... and {len(unresolved_fs_media) - 15} more", file=sys.stderr)
 
     if unresolved_ch:
         print(
@@ -607,7 +785,14 @@ def main() -> None:
     print(
         f"Filesets: {len(fileset_name_to_id)} existing, "
         f"{len(to_create_fs)} to create, {len(to_update_fs)} to update "
-        f"{filesets_channels_field!r}+{filesets_media_field!r}"
+        f"({filesets_channels_field!r}, {filesets_used_field!r}, "
+        f"{filesets_channel_versions_field!r}"
+        + (
+            f"; {filesets_media_field!r} when in AIRTABLE_FILESETS_WRITABLE_FIELDS"
+            if filesets_media_field in filesets_writable_fields
+            else ""
+        )
+        + ")"
         + (
             f", {n_fs_skipped} unchanged (skipped PATCH)"
             if n_fs_skipped
@@ -672,19 +857,23 @@ def main() -> None:
                 fs_link_ids.append(fid)
             else:
                 unresolved_fs.append((cnum, fsname))
-        med_link_ids: list[str] = []
-        for mname in parse_comma_separated_cell(row["Media"]):
-            mid = media_name_to_id.get(mname)
-            if mid:
-                med_link_ids.append(mid)
-            else:
-                unresolved_med.append((cnum, mname))
-        full_fields = {
+        full_fields: dict = {
             "Track": row["Track"],
             "CUE_NAME": row["CUE_NAME"],
-            cue_media_field: med_link_ids,
             cue_filesets_field: fs_link_ids,
         }
+        if cue_media_field in writable_fields:
+            med_link_ids: list[str] = []
+            if sync_media:
+                for mname in parse_comma_separated_cell(row["Media"]):
+                    mid = media_name_to_id.get(mname)
+                    if mid:
+                        med_link_ids.append(mid)
+                    else:
+                        unresolved_med.append((cnum, mname))
+            else:
+                med_link_ids = []
+            full_fields[cue_media_field] = med_link_ids
         enriched.append({"cnum": cnum, "full_fields": full_fields})
 
     used_orphan_ids: set[str] = set()

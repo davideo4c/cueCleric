@@ -3,14 +3,20 @@
 Export from Disguise cue tables + all_content_table.txt.
 
 Default outputs (Airtable-friendly):
-  exports/media.csv — one row per unique media file (verbose filename + optional v###); column Name.
   exports/channels.csv — one row per unique channel code (primary column Name), e.g. C01, C21.
-  exports/filesets.csv — one row per fileset; columns: Name, Channels (→ Channels), Media (→ Media).
-  exports/cues.csv — CUE_NUMBER, Track, CUE_NAME, Media (→ Media, per-file), Filesets (→ Filesets).
+  exports/filesets.csv — only filesets **used in the show**; columns: Name, Channels,
+    **Channel versions** (single-line text, e.g. `C01-v003,C11-v001` from latest `_vNNN` on disk),
+    **Used in show** (always TRUE for exported rows). No Media link column.
+  exports/cues.csv — CUE_NUMBER, Track, CUE_NAME, Filesets (no per-cue Media column).
     Cues with no tag / empty CUE_NUMBER are omitted. Duplicate non-empty CUE_NUMBER → fatal error.
+
+**No media.csv** — the Media table is not populated by this export (keeps Airtable record counts down).
 
 Media filenames are parsed as NNN-NNN-<channel>-<description>.<ext> (channel = C + alphanumerics),
 e.g. 000-021-c11-grids_and_guides.mov → fileset 000-021-grids_and_guides, channel C11.
+
+VideoFile: pass **--video-file-dir**, or a second folder picker (Cancel = skip scan). Scans drive **Channel versions**
+(max `_vNNN` per canonical filename).
 
 Optional legacy file (newlines in VIDEOS column):
   python3 export_cues_csv.py --combined-out exports/cues_with_videos.csv
@@ -21,6 +27,7 @@ Optional legacy file (newlines in VIDEOS column):
 
 Usage:
   python3 export_cues_csv.py
+  python3 export_cues_csv.py --input-dir "/path/to/disguise-export"
   python3 export_cues_csv.py --filesets-out a.csv --cues-out b.csv
 """
 
@@ -37,7 +44,6 @@ ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
 DEFAULT_ALL_CONTENT = ASSETS / "all_content_table.txt"
 DEFAULT_EXPORT_DIR = ROOT / "exports"
-DEFAULT_MEDIA_CSV = DEFAULT_EXPORT_DIR / "media.csv"
 DEFAULT_CHANNELS_CSV = DEFAULT_EXPORT_DIR / "channels.csv"
 DEFAULT_FILESETS_CSV = DEFAULT_EXPORT_DIR / "filesets.csv"
 DEFAULT_CUES_CSV = DEFAULT_EXPORT_DIR / "cues.csv"
@@ -56,6 +62,75 @@ def discover_cue_files_and_tracks(assets_dir: Path) -> list[tuple[Path, str]]:
         if track:
             pairs.append((cue_file, track))
     return pairs
+
+
+def pick_input_dir_gui() -> Path:
+    """Open a folder picker and return the chosen directory."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        raise SystemExit(
+            "Folder picker unavailable (tkinter not installed). "
+            "Use --input-dir /path/to/folder."
+        ) from exc
+
+    root = tk.Tk()
+    root.withdraw()
+    root.update()
+    chosen = filedialog.askdirectory(
+        title=(
+            "Navigate to your Disguise export folder — open the folder that contains "
+            "all_content_table.txt and *cue_table*.txt"
+        )
+    )
+    root.destroy()
+    if not chosen:
+        raise SystemExit("No folder selected.")
+    return Path(chosen)
+
+
+def pick_video_file_dir_gui(initial_dir: Path | None = None) -> Path | None:
+    """
+    Second folder picker: root folder for rendered media (e.g. VideoFile/).
+    Cancel → None (no disk scan; Version / On disk come only from CSV defaults).
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        raise SystemExit(
+            "VideoFile folder picker unavailable (tkinter not installed). "
+            "Pass --video-file-dir /path/to/VideoFile to set the path on the command line."
+        ) from exc
+
+    root = tk.Tk()
+    root.withdraw()
+    root.update()
+    kwargs: dict = {
+        "title": (
+            "Navigate to VideoFile — open the root folder that holds rendered media "
+            "(often named VideoFile, with subfolders such as 000-Grids)"
+        ),
+    }
+    if initial_dir is not None and initial_dir.is_dir():
+        kwargs["initialdir"] = str(initial_dir)
+    chosen = filedialog.askdirectory(**kwargs)
+    root.destroy()
+    if not chosen:
+        return None
+    return Path(chosen)
+
+
+def resolve_input_dir(cli_value: Path | None) -> Path:
+    """
+    Option A:
+      - if --input-dir is provided, use it
+      - otherwise open a GUI folder picker
+    """
+    if cli_value is not None:
+        return cli_value
+    return pick_input_dir_gui()
 
 
 def parse_tc(tc: str) -> float | None:
@@ -236,6 +311,132 @@ def normalized_video_filename_from_disguise_value(disguise_value: str) -> str:
     return extract_final_media_filename(asset_name_only(disguise_value))
 
 
+# Disk filenames: strip trailing `_v001`, `-v02`, `.v3` from stem (before extension).
+_DISK_VERSION_SUFFIX_RE = re.compile(r"(?i)([._-]v)(\d+)$")
+
+
+def disk_canonical_name_and_version(filename: str) -> tuple[str, int] | None:
+    """
+    From a disk basename (e.g. 000-011-c02-guides_v003.mov), return
+    (canonical Name, version int). If no _vNNN suffix, version defaults to 1.
+    """
+    name = (filename or "").strip()
+    if not name:
+        return None
+    lower = name.lower()
+    ext = ""
+    for e in sorted(_MEDIA_EXT_SUFFIXES, key=len, reverse=True):
+        if lower.endswith(e):
+            ext = name[len(name) - len(e) :]
+            stem = name[: len(name) - len(e)]
+            break
+    else:
+        return None
+    m = _DISK_VERSION_SUFFIX_RE.search(stem)
+    if m:
+        base_stem = stem[: m.start(1)]
+        ver = int(m.group(2))
+    else:
+        base_stem, ver = stem, 1
+    canonical = f"{base_stem}{ext}"
+    return (canonical, ver)
+
+
+def canonical_media_name_from_disguise_final(final: str) -> str | None:
+    """
+    Disk-canonical media Name: first filename token (no separate Disguise ` v###` token),
+    then strip disk-style `_vNNN` / `-vN` / `.vN` from the stem so it matches VideoFile scan keys.
+    """
+    s = (final or "").strip()
+    if not s:
+        return None
+    token = first_media_token(s)
+    if not token or not asset_has_media_file_extension(token):
+        return None
+    parsed = disk_canonical_name_and_version(token)
+    if parsed is None:
+        return token.strip()
+    return parsed[0]
+
+
+def scan_video_file_directory(root: Path) -> dict[str, int]:
+    """
+    Walk root recursively; group by canonical Name; return max version per Name.
+    """
+    best: dict[str, int] = {}
+    if not root.is_dir():
+        return best
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        parsed = disk_canonical_name_and_version(path.name)
+        if parsed is None:
+            continue
+        name, ver = parsed
+        prev = best.get(name)
+        if prev is None or ver > prev:
+            best[name] = ver
+    return best
+
+
+def format_channel_versions_summary(
+    media_names: list[str],
+    version_by_canonical: dict[str, int],
+) -> str:
+    """
+    Single-line text for Filesets: per channel, max version among media in this fileset.
+    Example: C01-v003,C11-v001 (comma-separated, no spaces; version zero-padded to 3 digits).
+    """
+    ch_to_ver: dict[str, int] = {}
+    for name in media_names:
+        spec = fileset_key_and_channel_from_final(name)
+        if spec is None:
+            continue
+        _fkey, ch = spec
+        ver = int(version_by_canonical.get(name, 1))
+        prev = ch_to_ver.get(ch)
+        if prev is None or ver > prev:
+            ch_to_ver[ch] = ver
+    if not ch_to_ver:
+        return ""
+    parts = [f"{ch}-v{ch_to_ver[ch]:03d}" for ch in sorted(ch_to_ver.keys())]
+    return ",".join(parts)
+
+
+def merge_fileset_aggregates_from_tracks(
+    tracks: dict[str, list[dict]],
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """
+    Every fileset key and its channels / canonical media names appearing anywhere
+    in all_content_table (all tracks / sections). Used for filesets.csv rows.
+    """
+    fc: defaultdict[str, set[str]] = defaultdict(set)
+    fm: defaultdict[str, set[str]] = defaultdict(set)
+    for sections in tracks.values():
+        for sec in sections:
+            section_filesets_and_media_for_videos(
+                sec.get("videos") or {}, fc, fm
+            )
+    fs_ch = {k: sorted(v) for k, v in fc.items()}
+    fs_med = {k: sorted(v) for k, v in fm.items()}
+    return fs_ch, fs_med
+
+
+def collect_used_fileset_keys_from_tracks(tracks: dict[str, list[dict]]) -> set[str]:
+    """Every fileset key derived from any video row in the content table."""
+    out: set[str] = set()
+    for sections in tracks.values():
+        for sec in sections:
+            for val in (sec.get("videos") or {}).values():
+                fin = normalized_video_filename_from_disguise_value(val)
+                if not fin or not asset_has_media_file_extension(fin):
+                    continue
+                spec = fileset_key_and_channel_from_final(fin)
+                if spec:
+                    out.add(spec[0])
+    return out
+
+
 def read_cue_table(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
@@ -339,7 +540,7 @@ def find_best_section(
 
 
 def normalized_media_files_for_section_videos(videos: dict[str, str]) -> list[str]:
-    """Ordered unique final filenames (for legacy VIDEOS column)."""
+    """Ordered unique disk-canonical Names (for legacy VIDEOS column)."""
     if not videos:
         return []
     names: list[str] = []
@@ -352,9 +553,11 @@ def normalized_media_files_for_section_videos(videos: dict[str, str]) -> list[st
             continue
         if not asset_has_media_file_extension(final):
             continue
-        if final not in seen:
-            seen.add(final)
-            names.append(final)
+        canon = canonical_media_name_from_disguise_final(final)
+        if not canon or canon in seen:
+            continue
+        seen.add(canon)
+        names.append(canon)
     return names
 
 
@@ -364,7 +567,7 @@ def section_filesets_and_media_for_videos(
     fileset_media: defaultdict[str, set[str]],
 ) -> tuple[list[str], list[str]]:
     """
-    For one section's videos: ordered unique fileset keys, ordered unique media filenames.
+    For one section's videos: ordered unique fileset keys, ordered unique disk-canonical media Names.
     Updates fileset_channels and fileset_media with every parsed file.
     """
     if not videos:
@@ -382,15 +585,18 @@ def section_filesets_and_media_for_videos(
         spec = fileset_key_and_channel_from_final(final)
         if spec is None:
             continue
+        canon = canonical_media_name_from_disguise_final(final)
+        if not canon:
+            continue
         fkey, ch = spec
         fileset_channels[fkey].add(ch)
-        fileset_media[fkey].add(final)
+        fileset_media[fkey].add(canon)
         if fkey not in seen_fs:
             seen_fs.add(fkey)
             keys.append(fkey)
-        if final not in seen_m:
-            seen_m.add(final)
-            media.append(final)
+        if canon not in seen_m:
+            seen_m.add(canon)
+            media.append(canon)
     return keys, media
 
 
@@ -400,7 +606,9 @@ def format_videos_field(videos: dict[str, str]) -> str:
 
 
 def build_cue_and_fileset_rows(
-    all_content_path: Path, assets_dir: Path
+    all_content_path: Path,
+    assets_dir: Path,
+    tracks: dict[str, list[dict]] | None = None,
 ) -> tuple[
     list[dict[str, str | list[str]]],
     dict[str, list[str]],
@@ -411,10 +619,11 @@ def build_cue_and_fileset_rows(
     Returns:
       cue_rows: track, cue_number, cue_name, media (filenames), filesets (fileset keys)
       filesets_channels: fileset key -> sorted channel codes
-      filesets_media: fileset key -> sorted media Names for that fileset
-      media_names: sorted unique media Names (for media.csv)
+      filesets_media: fileset key -> sorted disk-canonical media Names for that fileset
+      media_names: sorted unique Names appearing in filesets (for disguise catalog / media.csv merge)
     """
-    tracks = parse_all_content(all_content_path)
+    if tracks is None:
+        tracks = parse_all_content(all_content_path)
     cue_file_track_pairs = discover_cue_files_and_tracks(assets_dir)
     cue_rows: list[dict[str, str | list[str]]] = []
     fileset_channels: defaultdict[str, set[str]] = defaultdict(set)
@@ -471,26 +680,26 @@ def assert_unique_cue_numbers(cue_rows: list[dict[str, str | list[str]]]) -> Non
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export media, channels, filesets, and cues CSVs for Airtable."
+        description="Export channels, filesets, and cues CSVs for Airtable (no media.csv)."
     )
     parser.add_argument(
         "-i",
         "--input",
         type=Path,
-        default=DEFAULT_ALL_CONTENT,
-        help="Path to all_content_table.txt",
+        default=None,
+        help="Optional explicit path to all_content_table.txt (overrides --input-dir/picker)",
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=None,
+        help="Folder containing all_content_table.txt and *cue_table*.txt; if omitted, opens a folder picker",
     )
     parser.add_argument(
         "--export-dir",
         type=Path,
         default=DEFAULT_EXPORT_DIR,
-        help="Directory for default media.csv, channels.csv, filesets.csv, cues.csv",
-    )
-    parser.add_argument(
-        "--media-out",
-        type=Path,
-        default=None,
-        help="Override path for media.csv",
+        help="Directory for default channels.csv, filesets.csv, cues.csv",
     )
     parser.add_argument(
         "--channels-out",
@@ -516,34 +725,58 @@ def main() -> None:
         default=None,
         help="Optional legacy CSV with VIDEOS column (newlines)",
     )
+    parser.add_argument(
+        "--video-file-dir",
+        type=Path,
+        default=None,
+        help="Root folder to scan for media files (e.g. …/VideoFile). If omitted, a folder "
+        "picker opens (after the cue export folder is chosen); Cancel skips disk scan. "
+        "The picker starts in <input-dir>/VideoFile when that path exists.",
+    )
     args = parser.parse_args()
 
-    all_content_path: Path = args.input
+    input_dir = resolve_input_dir(args.input_dir)
+    if not input_dir.is_dir():
+        raise SystemExit(f"Input directory does not exist: {input_dir}")
+
+    all_content_path: Path = args.input or (input_dir / "all_content_table.txt")
     if not all_content_path.is_file():
         raise SystemExit(f"Missing input file: {all_content_path}")
 
+    video_root: Path | None
+    if args.video_file_dir is not None:
+        video_root = args.video_file_dir
+        if not video_root.is_dir():
+            raise SystemExit(f"VideoFile directory does not exist: {video_root}")
+    else:
+        candidate = input_dir / "VideoFile"
+        video_root = pick_video_file_dir_gui(
+            candidate if candidate.is_dir() else input_dir
+        )
+
     export_dir = args.export_dir
-    media_path = args.media_out or (export_dir / "media.csv")
     channels_path = args.channels_out or (export_dir / "channels.csv")
     filesets_path = args.filesets_out or (export_dir / "filesets.csv")
     cues_path = args.cues_out or (export_dir / "cues.csv")
 
-    cue_rows, filesets_map, filesets_media_map, media_names = (
-        build_cue_and_fileset_rows(all_content_path, ASSETS)
+    tracks = parse_all_content(all_content_path)
+    cue_rows, _fs_map, _fs_med_map, _all_media = build_cue_and_fileset_rows(
+        all_content_path, input_dir, tracks
     )
     assert_unique_cue_numbers(cue_rows)
 
+    used_filesets = collect_used_fileset_keys_from_tracks(tracks)
+    global_fs_ch, global_fs_med = merge_fileset_aggregates_from_tracks(tracks)
+
+    disk_max: dict[str, int] = {}
+    if video_root is not None and video_root.is_dir():
+        disk_max = scan_video_file_directory(video_root)
+
     export_dir.mkdir(parents=True, exist_ok=True)
 
-    with media_path.open("w", newline="", encoding="utf-8") as f:
-        mw = csv.DictWriter(f, fieldnames=["Name"], quoting=csv.QUOTE_MINIMAL)
-        mw.writeheader()
-        for name in media_names:
-            mw.writerow({"Name": name})
-
     all_channel_codes: set[str] = set()
-    for chans in filesets_map.values():
-        all_channel_codes.update(chans)
+    for fs_name in used_filesets:
+        all_channel_codes.update(global_fs_ch.get(fs_name, []))
 
     with channels_path.open("w", newline="", encoding="utf-8") as f:
         cw = csv.DictWriter(f, fieldnames=["Name"], quoting=csv.QUOTE_MINIMAL)
@@ -551,26 +784,31 @@ def main() -> None:
         for code in sorted(all_channel_codes):
             cw.writerow({"Name": code})
 
-    # Filesets: Channels → Channels table; Media → Media table (comma-separated Names)
+    # Filesets: only used-in-show rows; Channel versions = text summary (not Media links).
+    fileset_rows_written = 0
     with filesets_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
-            fieldnames=["Name", "Channels", "Media"],
+            fieldnames=["Name", "Channels", "Channel versions", "Used in show"],
             quoting=csv.QUOTE_MINIMAL,
         )
         w.writeheader()
-        for name in sorted(filesets_map.keys()):
-            med = filesets_media_map.get(name, [])
+        for name in sorted(used_filesets):
+            chans = global_fs_ch.get(name, [])
+            med = global_fs_med.get(name, [])
+            cv_line = format_channel_versions_summary(med, disk_max)
             w.writerow(
                 {
                     "Name": name,
-                    "Channels": ",".join(filesets_map[name]),
-                    "Media": ",".join(med),
+                    "Channels": ",".join(chans),
+                    "Channel versions": cv_line,
+                    "Used in show": "TRUE",
                 }
             )
+            fileset_rows_written += 1
 
     # Cues: primary field CUE_NUMBER (globally unique). Omit rows with no tag / empty number.
-    cue_fieldnames = ["CUE_NUMBER", "Track", "CUE_NAME", "Media", "Filesets"]
+    cue_fieldnames = ["CUE_NUMBER", "Track", "CUE_NAME", "Filesets"]
     airtable_cue_rows = [
         r
         for r in cue_rows
@@ -584,9 +822,7 @@ def main() -> None:
             track = str(row["track"])
             num = str(row["cue_number"]).strip()
             name = str(row["cue_name"])
-            med_list = row["media"]
             fs_list = row["filesets"]
-            assert isinstance(med_list, list)
             assert isinstance(fs_list, list)
             w.writerow(
                 {
@@ -594,22 +830,21 @@ def main() -> None:
                     "Track": track,
                     "CUE_NAME": name,
                     # No spaces after commas — Airtable matches linked record names exactly
-                    "Media": ",".join(med_list),
                     "Filesets": ",".join(fs_list),
                 }
             )
 
-    print(f"Wrote {len(media_names)} media rows -> {media_path}")
     print(f"Wrote {len(all_channel_codes)} channel rows -> {channels_path}")
-    print(f"Wrote {len(filesets_map)} fileset rows -> {filesets_path}")
+    print(
+        f"Wrote {fileset_rows_written} fileset rows (used in show only) -> {filesets_path}"
+    )
     print(f"Wrote {len(airtable_cue_rows)} cue rows -> {cues_path} (omitted {omitted} with empty CUE_NUMBER)")
 
     if args.combined_out is not None:
         combined = args.combined_out
         combined.parent.mkdir(parents=True, exist_ok=True)
-        tracks = parse_all_content(all_content_path)
         legacy_rows: list[dict[str, str]] = []
-        for cue_file, track in discover_cue_files_and_tracks(ASSETS):
+        for cue_file, track in discover_cue_files_and_tracks(input_dir):
             cues = read_cue_table(cue_file)
             sections = tracks.get(track, [])
             for c in cues:
