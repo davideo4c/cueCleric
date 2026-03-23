@@ -6,7 +6,7 @@ Default outputs (Airtable-friendly):
   exports/media.csv — one row per unique media file (verbose filename + optional v###); column Name.
   exports/channels.csv — one row per unique channel code (primary column Name), e.g. C01, C21.
   exports/filesets.csv — one row per fileset; columns: Name, Channels (→ Channels), Media (→ Media).
-  exports/cues.csv — CUE_NUMBER, Act, CUE_NAME, Media (→ Media, per-file), Filesets (→ Filesets).
+  exports/cues.csv — CUE_NUMBER, Track, CUE_NAME, Media (→ Media, per-file), Filesets (→ Filesets).
     Cues with no tag / empty CUE_NUMBER are omitted. Duplicate non-empty CUE_NUMBER → fatal error.
 
 Media filenames are parsed as NNN-NNN-<channel>-<description>.<ext> (channel = C + alphanumerics),
@@ -409,7 +409,7 @@ def build_cue_and_fileset_rows(
 ]:
     """
     Returns:
-      cue_rows: act, cue_number, cue_name, media (filenames), filesets (fileset keys)
+      cue_rows: track, cue_number, cue_name, media (filenames), filesets (fileset keys)
       filesets_channels: fileset key -> sorted channel codes
       filesets_media: fileset key -> sorted media Names for that fileset
       media_names: sorted unique media Names (for media.csv)
@@ -440,7 +440,7 @@ def build_cue_and_fileset_rows(
 
             cue_rows.append(
                 {
-                    "act": track,
+                    "track": track,
                     "cue_number": num,
                     "cue_name": note,
                     "media": media_list,
@@ -464,9 +464,9 @@ def assert_unique_cue_numbers(cue_rows: list[dict[str, str | list[str]]]) -> Non
         if num in seen:
             raise SystemExit(
                 f"Duplicate CUE_NUMBER {num!r} (Airtable primary must be unique). "
-                f"First row: {seen[num]}; duplicate context: act={row['act']!r} name={row['cue_name']!r}"
+                f"First row: {seen[num]}; duplicate context: track={row['track']!r} name={row['cue_name']!r}"
             )
-        seen[num] = f"act={row['act']!r} name={row['cue_name']!r}"
+        seen[num] = f"track={row['track']!r} name={row['cue_name']!r}"
 
 
 def main() -> None:
@@ -570,7 +570,7 @@ def main() -> None:
             )
 
     # Cues: primary field CUE_NUMBER (globally unique). Omit rows with no tag / empty number.
-    cue_fieldnames = ["CUE_NUMBER", "Act", "CUE_NAME", "Media", "Filesets"]
+    cue_fieldnames = ["CUE_NUMBER", "Track", "CUE_NAME", "Media", "Filesets"]
     airtable_cue_rows = [
         r
         for r in cue_rows
@@ -581,7 +581,7 @@ def main() -> None:
         w = csv.DictWriter(f, fieldnames=cue_fieldnames, quoting=csv.QUOTE_MINIMAL)
         w.writeheader()
         for row in airtable_cue_rows:
-            act = str(row["act"])
+            track = str(row["track"])
             num = str(row["cue_number"]).strip()
             name = str(row["cue_name"])
             med_list = row["media"]
@@ -591,7 +591,7 @@ def main() -> None:
             w.writerow(
                 {
                     "CUE_NUMBER": num,
-                    "Act": act,
+                    "Track": track,
                     "CUE_NAME": name,
                     # No spaces after commas — Airtable matches linked record names exactly
                     "Media": ",".join(med_list),
@@ -624,7 +624,7 @@ def main() -> None:
                 )
                 legacy_rows.append(
                     {
-                        "Act": track,
+                        "Track": track,
                         "CUE_NUMBER": tag_to_cue_number(tag),
                         "CUE_NAME": note,
                         "VIDEOS": vids,
@@ -633,7 +633,7 @@ def main() -> None:
         with combined.open("w", newline="", encoding="utf-8") as f:
             wr = csv.DictWriter(
                 f,
-                fieldnames=["Act", "CUE_NUMBER", "CUE_NAME", "VIDEOS"],
+                fieldnames=["Track", "CUE_NUMBER", "CUE_NAME", "VIDEOS"],
                 quoting=csv.QUOTE_MINIMAL,
             )
             wr.writeheader()

@@ -24,7 +24,7 @@ Optional:
   AIRTABLE_CUE_MEDIA_FIELD          Cues → Media (multiple). Default: Media
   AIRTABLE_CUE_FILESETS_FIELD       Cues → Filesets (multiple). Default: Filesets
   AIRTABLE_CUE_PRIMARY_FIELD        Primary on Cues (CUE_NUMBER). Default: CUE_NUMBER
-  AIRTABLE_CUE_WRITABLE_FIELDS      Default: Act,CUE_NAME,Media,Filesets
+  AIRTABLE_CUE_WRITABLE_FIELDS      Default: Track,CUE_NAME,Media,Filesets
   AIRTABLE_CUE_NOTES_FIELD          Orphan retention. Default: Notes
 
 Usage:
@@ -284,7 +284,7 @@ def read_cues_csv(path: Path) -> tuple[list[dict[str, str]], int]:
     """Return (rows with non-empty CUE_NUMBER, count of skipped empty rows)."""
     rows: list[dict[str, str]] = []
     skipped_empty = 0
-    required = {"CUE_NUMBER", "Act", "CUE_NAME", "Media", "Filesets"}
+    required = {"CUE_NUMBER", "Track", "CUE_NAME", "Media", "Filesets"}
     with path.open(encoding="utf-8", newline="") as f:
         r = csv.DictReader(f)
         if not r.fieldnames or not required.issubset(set(r.fieldnames)):
@@ -307,7 +307,7 @@ def parse_comma_separated_cell(cell: str) -> list[str]:
 
 def parse_writable_fields(env_val: str) -> list[str]:
     """Fields allowed on PATCH (must not include manual-only fields)."""
-    raw = (env_val or "Act,CUE_NAME,Media,Filesets").strip()
+    raw = (env_val or "Track,CUE_NAME,Media,Filesets").strip()
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
@@ -680,7 +680,7 @@ def main() -> None:
             else:
                 unresolved_med.append((cnum, mname))
         full_fields = {
-            "Act": row["Act"],
+            "Track": row["Track"],
             "CUE_NAME": row["CUE_NAME"],
             cue_media_field: med_link_ids,
             cue_filesets_field: fs_link_ids,
