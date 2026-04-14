@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -22,6 +23,68 @@ DEFAULT_EXPORT_DIR = ROOT / "exports"
 DEFAULT_CHANNELS_CSV = DEFAULT_EXPORT_DIR / "channels.csv"
 DEFAULT_FILESETS_CSV = DEFAULT_EXPORT_DIR / "filesets.csv"
 DEFAULT_CUES_CSV = DEFAULT_EXPORT_DIR / "cues.csv"
+
+_IGNORE_ANY_RE: re.Pattern[str] | None = None
+_IGNORE_MEDIA_RE: re.Pattern[str] | None = None
+_IGNORE_FILESETS_RE: re.Pattern[str] | None = None
+
+
+def load_dotenv_if_present() -> None:
+    """Load KEY=VALUE lines from .env in project root."""
+    env_path = ROOT / ".env"
+    if not env_path.is_file():
+        return
+    for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if key:
+            os.environ[key] = val
+
+
+def _compile_optional_regex(expr: str) -> re.Pattern[str] | None:
+    e = (expr or "").strip()
+    if not e:
+        return None
+    try:
+        return re.compile(e)
+    except re.error as exc:
+        raise SystemExit(f"Invalid ignore regex {e!r}: {exc}") from exc
+
+
+def init_ignore_regexes_from_env() -> None:
+    """Initialize optional ignore regex filters from environment variables."""
+    global _IGNORE_ANY_RE, _IGNORE_MEDIA_RE, _IGNORE_FILESETS_RE
+    _IGNORE_ANY_RE = _compile_optional_regex(os.environ.get("AIRTABLE_IGNORE_REGEX", ""))
+    _IGNORE_MEDIA_RE = _compile_optional_regex(
+        os.environ.get("AIRTABLE_IGNORE_MEDIA_REGEX", "")
+    )
+    _IGNORE_FILESETS_RE = _compile_optional_regex(
+        os.environ.get("AIRTABLE_IGNORE_FILESETS_REGEX", "")
+    )
+
+
+def should_ignore_media_name(name: str) -> bool:
+    s = (name or "").strip()
+    if not s:
+        return False
+    return bool(
+        (_IGNORE_ANY_RE and _IGNORE_ANY_RE.search(s))
+        or (_IGNORE_MEDIA_RE and _IGNORE_MEDIA_RE.search(s))
+    )
+
+
+def should_ignore_fileset_name(name: str) -> bool:
+    s = (name or "").strip()
+    if not s:
+        return False
+    return bool(
+        (_IGNORE_ANY_RE and _IGNORE_ANY_RE.search(s))
+        or (_IGNORE_FILESETS_RE and _IGNORE_FILESETS_RE.search(s))
+    )
 
 def discover_cue_files_and_tracks(assets_dir: Path) -> list[tuple[Path, str]]:
     """
@@ -348,6 +411,8 @@ def scan_video_file_directory(root: Path) -> dict[str, int]:
         if parsed is None:
             continue
         name, ver = parsed
+        if should_ignore_media_name(name):
+            continue
         prev = best.get(name)
         if prev is None or ver > prev:
             best[name] = ver
@@ -408,7 +473,8 @@ def collect_used_fileset_keys_from_tracks(tracks: dict[str, list[dict]]) -> set[
                     continue
                 spec = fileset_key_and_channel_from_final(fin)
                 if spec:
-                    out.add(spec[0])
+                    if not should_ignore_fileset_name(spec[0]):
+                        out.add(spec[0])
     return out
 
 
@@ -529,7 +595,7 @@ def normalized_media_files_for_section_videos(videos: dict[str, str]) -> list[st
         if not asset_has_media_file_extension(final):
             continue
         canon = canonical_media_name_from_disguise_final(final)
-        if not canon or canon in seen:
+        if not canon or should_ignore_media_name(canon) or canon in seen:
             continue
         seen.add(canon)
         names.append(canon)
@@ -564,6 +630,8 @@ def section_filesets_and_media_for_videos(
         if not canon:
             continue
         fkey, ch = spec
+        if should_ignore_fileset_name(fkey) or should_ignore_media_name(canon):
+            continue
         fileset_channels[fkey].add(ch)
         fileset_media[fkey].add(canon)
         if fkey not in seen_fs:
@@ -596,6 +664,9 @@ def format_video_layers_used(videos: dict[str, str]) -> str:
             resolved = asset_name_only(disguise_value).strip()
         if not resolved:
             resolved = disguise_value.strip()
+        canon = canonical_media_name_from_disguise_final(resolved)
+        if canon and should_ignore_media_name(canon):
+            continue
         if not resolved or resolved in seen:
             continue
         seen.add(resolved)
@@ -680,6 +751,9 @@ def assert_unique_cue_numbers(cue_rows: list[dict[str, str | list[str]]]) -> Non
 
 
 def main() -> None:
+    load_dotenv_if_present()
+    init_ignore_regexes_from_env()
+
     parser = argparse.ArgumentParser(
         description="Export Disguise data to CSVs for Airtable."
     )

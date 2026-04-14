@@ -8,6 +8,7 @@ Disguise exports → CSVs → optional Airtable sync.
 python3 export_cues_csv.py --input-dir /path/to/disguise-export
 # Optional: --video-file-dir /path/to/VideoFile   (channel version text from disk)
 # Or: --pick-video-file-dir   (Tk picker; needs python-tk)
+# Optional (.env): AIRTABLE_IGNORE_REGEX=^090-    (exclude matching filesets/media from exports)
 
 python3 push_airtable.py --dry-run
 python3 push_airtable.py   # needs .env (see docs/AIRTABLE.md)
@@ -16,8 +17,6 @@ python3 push_airtable.py   # needs .env (see docs/AIRTABLE.md)
 Without `--input-dir`, export opens a folder picker (needs Tk).
 
 **Requirements:** Python 3.9+. Stdlib only unless you use a venv for other tools.
-
-**Secrets:** Do not commit `.env`. Copy from `.env.example`.
 
 ## Layout
 

@@ -9,6 +9,8 @@ python3 export_cues_csv.py --input-dir /path/to/folder   # all_content + *cue_ta
 - **`--video-file-dir`** — scan disk for `_vNNN` → **Channel versions** in `filesets.csv`.
 - **`--pick-video-file-dir`** — choose that folder in a dialog (Tk). Default is no scan.
 - **`--combined-out path.csv`** — legacy cue CSV with a **VIDEOS** column.
+- Optional `.env` ignore filters (loaded by export): `AIRTABLE_IGNORE_REGEX`, `AIRTABLE_IGNORE_FILESETS_REGEX`, `AIRTABLE_IGNORE_MEDIA_REGEX`.
+  - Example: `AIRTABLE_IGNORE_REGEX=^090-` excludes any fileset/media name beginning with `090-` from exported lists.
 
 Writes **`exports/channels.csv`**, **`filesets.csv`**, **`cues.csv`**. No `media.csv`.
 
@@ -48,6 +50,9 @@ AIRTABLE_BASE_ID=app...
 | Variable | Role |
 |----------|------|
 | `AIRTABLE_SYNC_MEDIA` | Set `1` to sync **Media** (requires `media.csv`). |
+| `AIRTABLE_IGNORE_REGEX` | Export-time regex applied to both fileset keys and media names (filter out matches). |
+| `AIRTABLE_IGNORE_FILESETS_REGEX` | Export-time regex for fileset keys only. |
+| `AIRTABLE_IGNORE_MEDIA_REGEX` | Export-time regex for media names only. |
 | `AIRTABLE_MEDIA_*` | Table/field names when media sync is on. |
 | `AIRTABLE_CHANNELS_TABLE` | Default `Channels` |
 | `AIRTABLE_FILESETS_TABLE` | Default `Filesets` |
