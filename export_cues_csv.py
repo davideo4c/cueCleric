@@ -1,34 +1,9 @@
 #!/usr/bin/env python3
 """
-Export from Disguise cue tables + all_content_table.txt.
+Export Disguise `all_content_table.txt` + `*cue_table*.txt` → exports/channels.csv, filesets.csv, cues.csv.
 
-Default outputs (Airtable-friendly):
-  exports/channels.csv — one row per unique channel code (primary column Name), e.g. C01, C21.
-  exports/filesets.csv — only filesets **used in the show**; columns: Name, Channels,
-    **Channel versions** (single-line text, e.g. `C01-v003,C11-v001` from latest `_vNNN` on disk),
-    **Used in show** (always TRUE for exported rows). No Media link column.
-  exports/cues.csv — CUE_NUMBER, Track, CUE_NAME, Filesets (no per-cue Media column).
-    Cues with no tag / empty CUE_NUMBER are omitted. Duplicate non-empty CUE_NUMBER → fatal error.
-
-**No media.csv** — the Media table is not populated by this export (keeps Airtable record counts down).
-
-Media filenames are parsed as NNN-NNN-<channel>-<description>.<ext> (channel = C + alphanumerics),
-e.g. 000-021-c11-grids_and_guides.mov → fileset 000-021-grids_and_guides, channel C11.
-
-VideoFile: pass **--video-file-dir**, or a second folder picker (Cancel = skip scan). Scans drive **Channel versions**
-(max `_vNNN` per canonical filename).
-
-Optional legacy file (newlines in VIDEOS column):
-  python3 export_cues_csv.py --combined-out exports/cues_with_videos.csv
-
-- CUE_NUMBER: TAG parsed from CUE XX.YYY.ZZ (pad to 2-3-2 digits) as
-    int(XX)*100 + int(YYY) + int(ZZ)/100
-- CUE_NAME: Note column
-
-Usage:
-  python3 export_cues_csv.py
-  python3 export_cues_csv.py --input-dir "/path/to/disguise-export"
-  python3 export_cues_csv.py --filesets-out a.csv --cues-out b.csv
+Optional disk scan: --video-file-dir or --pick-video-file-dir (otherwise no VideoFile step).
+See docs/AIRTABLE.md for CSV columns and Airtable workflow.
 """
 
 from __future__ import annotations
@@ -605,6 +580,29 @@ def format_videos_field(videos: dict[str, str]) -> str:
     return "\n".join(normalized_media_files_for_section_videos(videos))
 
 
+def format_video_layers_used(videos: dict[str, str]) -> str:
+    """
+    Newline-separated list of distinct resolved media filenames for this cue's section,
+    in layer name order (no output/layer labels).
+    """
+    if not videos:
+        return ""
+    seen: set[str] = set()
+    lines: list[str] = []
+    for _layer in sorted(videos.keys()):
+        disguise_value = videos.get(_layer) or ""
+        resolved = normalized_video_filename_from_disguise_value(disguise_value)
+        if not resolved:
+            resolved = asset_name_only(disguise_value).strip()
+        if not resolved:
+            resolved = disguise_value.strip()
+        if not resolved or resolved in seen:
+            continue
+        seen.add(resolved)
+        lines.append(resolved)
+    return "\n".join(lines)
+
+
 def build_cue_and_fileset_rows(
     all_content_path: Path,
     assets_dir: Path,
@@ -642,10 +640,12 @@ def build_cue_and_fileset_rows(
             best = find_best_section(sections, note, tc)
             fileset_list: list[str] = []
             media_list: list[str] = []
+            video_layers_used = ""
             if best is not None:
                 fileset_list, media_list = section_filesets_and_media_for_videos(
                     best.get("videos") or {}, fileset_channels, fileset_media
                 )
+                video_layers_used = format_video_layers_used(best.get("videos") or {})
 
             cue_rows.append(
                 {
@@ -654,6 +654,7 @@ def build_cue_and_fileset_rows(
                     "cue_name": note,
                     "media": media_list,
                     "filesets": fileset_list,
+                    "video_layers_used": video_layers_used,
                 }
             )
 
@@ -680,7 +681,7 @@ def assert_unique_cue_numbers(cue_rows: list[dict[str, str | list[str]]]) -> Non
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export channels, filesets, and cues CSVs for Airtable (no media.csv)."
+        description="Export Disguise data to CSVs for Airtable."
     )
     parser.add_argument(
         "-i",
@@ -729,9 +730,14 @@ def main() -> None:
         "--video-file-dir",
         type=Path,
         default=None,
-        help="Root folder to scan for media files (e.g. …/VideoFile). If omitted, a folder "
-        "picker opens (after the cue export folder is chosen); Cancel skips disk scan. "
-        "The picker starts in <input-dir>/VideoFile when that path exists.",
+        help="Root folder to scan for media files (e.g. …/VideoFile). If omitted, no disk scan "
+        "unless --pick-video-file-dir is used.",
+    )
+    parser.add_argument(
+        "--pick-video-file-dir",
+        action="store_true",
+        help="Open a folder picker for the VideoFile root (after input folder is chosen). "
+        "Ignored if --video-file-dir is set. Cancel → no scan.",
     )
     args = parser.parse_args()
 
@@ -748,11 +754,13 @@ def main() -> None:
         video_root = args.video_file_dir
         if not video_root.is_dir():
             raise SystemExit(f"VideoFile directory does not exist: {video_root}")
-    else:
+    elif args.pick_video_file_dir:
         candidate = input_dir / "VideoFile"
         video_root = pick_video_file_dir_gui(
             candidate if candidate.is_dir() else input_dir
         )
+    else:
+        video_root = None
 
     export_dir = args.export_dir
     channels_path = args.channels_out or (export_dir / "channels.csv")
@@ -771,6 +779,12 @@ def main() -> None:
     disk_max: dict[str, int] = {}
     if video_root is not None and video_root.is_dir():
         disk_max = scan_video_file_directory(video_root)
+        print(f"VideoFile scan: {video_root}")
+    else:
+        print(
+            "VideoFile scan skipped (no --video-file-dir). "
+            "Channel versions use defaults unless you pass --video-file-dir or --pick-video-file-dir."
+        )
 
     export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -808,7 +822,13 @@ def main() -> None:
             fileset_rows_written += 1
 
     # Cues: primary field CUE_NUMBER (globally unique). Omit rows with no tag / empty number.
-    cue_fieldnames = ["CUE_NUMBER", "Track", "CUE_NAME", "Filesets"]
+    cue_fieldnames = [
+        "CUE_NUMBER",
+        "Track",
+        "CUE_NAME",
+        "Filesets",
+        "Video layers used",
+    ]
     airtable_cue_rows = [
         r
         for r in cue_rows
@@ -831,6 +851,7 @@ def main() -> None:
                     "CUE_NAME": name,
                     # No spaces after commas — Airtable matches linked record names exactly
                     "Filesets": ",".join(fs_list),
+                    "Video layers used": str(row.get("video_layers_used") or ""),
                 }
             )
 

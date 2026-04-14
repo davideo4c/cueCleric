@@ -1,36 +1,8 @@
 #!/usr/bin/env python3
 """
-Push channels.csv, filesets.csv, and cues.csv to Airtable via the REST API.
+Push CSV exports to Airtable (channels, filesets, cues; Media only if AIRTABLE_SYNC_MEDIA=1).
 
-By default the **Media** table is **not** synced (set AIRTABLE_SYNC_MEDIA=1 to opt in and
-supply exports/media.csv).
-
-Prerequisites:
-  1. Run: python3 export_cues_csv.py
-  2. Create an Airtable base with tables/fields matching docs/AIRTABLE.md
-  3. Create a Personal Access Token (PAT) with data read/write on the base.
-
-Environment variables:
-  AIRTABLE_TOKEN       Required. PAT (starts with pat...)
-  AIRTABLE_BASE_ID     Required. Base ID (starts with app...)
-
-Optional:
-  AIRTABLE_SYNC_MEDIA               If 1/true/yes/on, sync Media table (requires media.csv)
-  AIRTABLE_MEDIA_TABLE              Default: Media
-  ... (other AIRTABLE_MEDIA_* when sync enabled)
-  AIRTABLE_CHANNELS_TABLE           Default: Channels
-  AIRTABLE_FILESETS_CHANNEL_VERSIONS_FIELD  Single line text on Filesets. Default: Channel versions
-  AIRTABLE_FILESETS_WRITABLE_FIELDS Default: Channels,Used in show,Channel versions (Media omitted)
-  AIRTABLE_CUE_WRITABLE_FIELDS      Default: Track,CUE_NAME,Filesets (add Media to sync/clear links)
-
-Usage:
-  export AIRTABLE_TOKEN=pat...
-  export AIRTABLE_BASE_ID=app...
-  python3 push_airtable.py --dry-run
-  python3 push_airtable.py
-
-  python3 push_airtable.py --channels-csv exports/channels.csv \\
-      --filesets-csv exports/filesets.csv --cues-csv exports/cues.csv
+Requires AIRTABLE_TOKEN and AIRTABLE_BASE_ID (.env or environment). Options: docs/AIRTABLE.md.
 """
 
 from __future__ import annotations
@@ -48,6 +20,8 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+# Must match export_cues_csv.py cues.csv header
+CUES_CSV_VIDEO_LAYERS_COL = "Video layers used"
 DEFAULT_MEDIA_CSV = ROOT / "exports" / "media.csv"
 DEFAULT_CHANNELS_CSV = ROOT / "exports" / "channels.csv"
 DEFAULT_FILESETS_CSV = ROOT / "exports" / "filesets.csv"
@@ -346,7 +320,13 @@ def read_cues_csv(path: Path) -> tuple[list[dict[str, str]], int]:
     """Return (rows with non-empty CUE_NUMBER, count of skipped empty rows)."""
     rows: list[dict[str, str]] = []
     skipped_empty = 0
-    required = {"CUE_NUMBER", "Track", "CUE_NAME", "Filesets"}
+    required = {
+        "CUE_NUMBER",
+        "Track",
+        "CUE_NAME",
+        "Filesets",
+        CUES_CSV_VIDEO_LAYERS_COL,
+    }
     with path.open(encoding="utf-8", newline="") as f:
         r = csv.DictReader(f)
         fn = set(r.fieldnames or [])
@@ -369,9 +349,9 @@ def parse_comma_separated_cell(cell: str) -> list[str]:
     return [p.strip() for p in cell.split(",") if p.strip()]
 
 
-def parse_writable_fields(env_val: str) -> list[str]:
+def parse_writable_fields(env_val: str, *, fallback: str) -> list[str]:
     """Fields allowed on PATCH (must not include manual-only fields)."""
-    raw = (env_val or "Track,CUE_NAME,Filesets").strip()
+    raw = (env_val.strip() if env_val.strip() else fallback).strip()
     return [x.strip() for x in raw.split(",") if x.strip()]
 
 
@@ -423,7 +403,7 @@ def main() -> None:
     load_dotenv_if_present()
 
     p = argparse.ArgumentParser(
-        description="Sync media + channels + filesets + cues CSVs to Airtable."
+        description="Push cueCleric CSV exports to Airtable."
     )
     p.add_argument("--media-csv", type=Path, default=DEFAULT_MEDIA_CSV)
     p.add_argument("--channels-csv", type=Path, default=DEFAULT_CHANNELS_CSV)
@@ -487,11 +467,15 @@ def main() -> None:
     cue_filesets_field = os.environ.get(
         "AIRTABLE_CUE_FILESETS_FIELD", "Filesets"
     ).strip()
+    cue_video_layers_field = os.environ.get(
+        "AIRTABLE_CUE_VIDEO_LAYERS_FIELD", CUES_CSV_VIDEO_LAYERS_COL
+    ).strip()
     cue_primary_field = os.environ.get(
         "AIRTABLE_CUE_PRIMARY_FIELD", "CUE_NUMBER"
     ).strip()
     writable_fields = parse_writable_fields(
-        os.environ.get("AIRTABLE_CUE_WRITABLE_FIELDS", "")
+        os.environ.get("AIRTABLE_CUE_WRITABLE_FIELDS", ""),
+        fallback=f"Track,CUE_NAME,Filesets,{cue_video_layers_field}",
     )
     # Never PATCH the primary field by mistake
     writable_fields = [f for f in writable_fields if f != cue_primary_field]
@@ -862,6 +846,8 @@ def main() -> None:
             "CUE_NAME": row["CUE_NAME"],
             cue_filesets_field: fs_link_ids,
         }
+        if cue_video_layers_field in writable_fields:
+            full_fields[cue_video_layers_field] = row[CUES_CSV_VIDEO_LAYERS_COL]
         if cue_media_field in writable_fields:
             med_link_ids: list[str] = []
             if sync_media:
